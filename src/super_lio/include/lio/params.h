@@ -98,6 +98,23 @@ namespace LI2Sup{
   extern bool g_update_map;
   extern double g_init_px, g_init_py, g_init_pz, g_init_roll, g_init_pitch, g_init_yaw;
 
+  /// relocation registration parameters
+  extern double g_reloc_target_ds_size;     // downsample leaf size for target map (0=skip)
+  extern double g_reloc_ndt_resolution;     // fine NDT resolution (final stage)
+  extern double g_reloc_icp_max_corr;       // ICP max correspondence distance
+  extern int    g_reloc_icp_max_iter;       // ICP max iterations
+  extern double g_reloc_fitness_thresh;     // ICP fitness score threshold
+  extern bool   g_reloc_multi_yaw_search;   // try multiple yaw angles on failure
+  extern double g_reloc_yaw_step_deg;       // yaw step for multi-yaw search
+  extern int    g_reloc_yaw_search_count;   // number of yaw candidates per side
+
+  /// multi-resolution NDT (coarse-to-fine)
+  extern double g_reloc_coarse_ds_size;         // coarse stage: target downsample leaf
+  extern double g_reloc_coarse_ndt_resolution;  // coarse stage: NDT voxel resolution
+  extern double g_reloc_medium_ds_size;         // medium stage: target downsample leaf
+  extern double g_reloc_medium_ndt_resolution;  // medium stage: NDT voxel resolution
+  extern bool   g_reloc_enable_multi_res;       // enable multi-resolution cascade
+
 }
 
 #endif

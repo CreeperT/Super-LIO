@@ -1,0 +1,66 @@
+/**:
+  ros__parameters:
+    lio.map.save_map: false
+    lio.map.if_filter: false
+    lio.map.save_map_dir: "map"
+    lio.map.map_name: "GroutingHole-DrainageHole.pcd"
+    lio.map.ds_size: 0.3
+    lio.map.save_interval: 500
+
+    lio.ros.lidar_topic: "/points_raw_combined"
+    lio.ros.imu_topic: "/dog_imu_raw"
+
+    lio.sensor.lidar_type: 2
+    lio.sensor.blind: 2.0
+    lio.sensor.maxrange: 150.0
+    lio.sensor.filter_rate: 3
+    lio.sensor.enable_downsample: true
+    lio.sensor.voxel_fliter_size: 0.5
+    lio.sensor.gravity_norm: 9.7946
+    lio.sensor.imu_type: 1
+    lio.sensor.imu_na: 0.1
+    lio.sensor.imu_ng: 0.1
+    lio.sensor.imu_nba: 0.0001
+    lio.sensor.imu_nbg: 0.0001
+
+    lio.extrinsic.lidar_imu: [0.0, 0.0, 0.0, 
+                              1.0, 0.0, 0.0, 
+                              0.0, 1.0, 0.0, 
+                              0.0, 0.0, 1.0]
+    lio.extrinsic.odom_robo: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    lio.hash_map.hash_capacity: 100000000
+    lio.hash_map.vox_resolution: 0.5
+
+    lio.kf.kf_type: 0
+    lio.kf.kf_max_iterations: 4
+    lio.kf.kf_align_gravity: true
+    lio.kf.kf_quit_eps: 0.001
+
+    lio.output.robot: false
+    lio.output.plan_env_world: false
+    lio.output.plan_env_body: false
+    lio.output.planner: false
+    lio.output.map: true
+    lio.output.dense: true
+    lio.output.pub_step: 10
+
+    lio.eva.timer: true
+
+    # relocation registration tuning
+    lio.relocation.update_map: false
+    lio.relocation.init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    lio.relocation.target_ds_size: 0.5
+    lio.relocation.ndt_resolution: 1.0
+    lio.relocation.icp_max_corr: 8.0
+    lio.relocation.icp_max_iter: 40
+    lio.relocation.fitness_thresh: 1.5
+    lio.relocation.multi_yaw_search: true
+    lio.relocation.yaw_step_deg: 30.0
+    lio.relocation.yaw_search_count: 6
+    # multi-resolution NDT cascade (coarse-to-fine)
+    lio.relocation.enable_multi_res: true
+    lio.relocation.coarse_ds_size: 1.5
+    lio.relocation.coarse_ndt_resolution: 5.0
+    lio.relocation.medium_ds_size: 0.8
+    lio.relocation.medium_ndt_resolution: 2.0

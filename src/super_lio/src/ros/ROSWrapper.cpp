@@ -1,6 +1,7 @@
 
 #include "ros/ROSWrapper.h"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include <pcl/common/transforms.h>
 
 
 using namespace BASIC;
@@ -189,6 +190,47 @@ void LoadParamFromRos(rclcpp::Node& node)
   g_init_roll  = init_pose[3];
   g_init_pitch = init_pose[4];
   g_init_yaw   = init_pose[5];
+
+  // relocation registration parameters
+  node.declare_parameter<double>("lio.relocation.target_ds_size", 0.5);
+  node.get_parameter("lio.relocation.target_ds_size", g_reloc_target_ds_size);
+
+  node.declare_parameter<double>("lio.relocation.ndt_resolution", 1.0);
+  node.get_parameter("lio.relocation.ndt_resolution", g_reloc_ndt_resolution);
+
+  node.declare_parameter<double>("lio.relocation.icp_max_corr", 8.0);
+  node.get_parameter("lio.relocation.icp_max_corr", g_reloc_icp_max_corr);
+
+  node.declare_parameter<int>("lio.relocation.icp_max_iter", 40);
+  node.get_parameter("lio.relocation.icp_max_iter", g_reloc_icp_max_iter);
+
+  node.declare_parameter<double>("lio.relocation.fitness_thresh", 1.5);
+  node.get_parameter("lio.relocation.fitness_thresh", g_reloc_fitness_thresh);
+
+  node.declare_parameter<bool>("lio.relocation.multi_yaw_search", false);
+  node.get_parameter("lio.relocation.multi_yaw_search", g_reloc_multi_yaw_search);
+
+  node.declare_parameter<double>("lio.relocation.yaw_step_deg", 30.0);
+  node.get_parameter("lio.relocation.yaw_step_deg", g_reloc_yaw_step_deg);
+
+  node.declare_parameter<int>("lio.relocation.yaw_search_count", 6);
+  node.get_parameter("lio.relocation.yaw_search_count", g_reloc_yaw_search_count);
+
+  // multi-resolution NDT parameters
+  node.declare_parameter<bool>("lio.relocation.enable_multi_res", true);
+  node.get_parameter("lio.relocation.enable_multi_res", g_reloc_enable_multi_res);
+
+  node.declare_parameter<double>("lio.relocation.coarse_ds_size", 1.5);
+  node.get_parameter("lio.relocation.coarse_ds_size", g_reloc_coarse_ds_size);
+
+  node.declare_parameter<double>("lio.relocation.coarse_ndt_resolution", 5.0);
+  node.get_parameter("lio.relocation.coarse_ndt_resolution", g_reloc_coarse_ndt_resolution);
+
+  node.declare_parameter<double>("lio.relocation.medium_ds_size", 0.8);
+  node.get_parameter("lio.relocation.medium_ds_size", g_reloc_medium_ds_size);
+
+  node.declare_parameter<double>("lio.relocation.medium_ndt_resolution", 2.0);
+  node.get_parameter("lio.relocation.medium_ndt_resolution", g_reloc_medium_ndt_resolution);
 
   LOG(INFO) << GREEN << " ---> [Params]: Load from ROS2 parameter server."
             << RESET;
@@ -618,7 +660,7 @@ void ROSWrapper::pub_odom(const NavState& state){
 
   tf_msg.header.stamp = odom.header.stamp;
   tf_msg.header.frame_id = "world";
-  tf_msg.child_frame_id = "imu";
+  tf_msg.child_frame_id = "dog_imu_link";
 
   tf_msg.transform.translation.x = state.p[0];
   tf_msg.transform.translation.y = state.p[1];
@@ -647,6 +689,22 @@ void ROSWrapper::pub_cloud_world(const CloudPtr& pc, double time){
   cloud.header.frame_id = "world";
   cloud.header.stamp = toRosTime(time);
   pub_cloud_world_->publish(cloud);
+}
+
+
+void ROSWrapper::pub_init_obs(const BASIC::CloudPtr& obs, const Eigen::Matrix4f& pose){
+  static auto pub_init_obs_ =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/lio/init_obs", 10);
+
+  pcl::PointCloud<pcl::PointXYZI>::Ptr transformed(new pcl::PointCloud<pcl::PointXYZI>());
+  pcl::transformPointCloud(*obs, *transformed, pose);
+
+  sensor_msgs::msg::PointCloud2 cloud;
+  pcl::toROSMsg(*transformed, cloud);
+  cloud.header.frame_id = "world";
+  cloud.header.stamp = this->now();
+  pub_init_obs_->publish(cloud);
 }
 
 
@@ -762,7 +820,7 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
           V3 init_translation;
           init_translation << msg->pose.pose.position.x,
                               msg->pose.pose.position.y,
-                              0.2;
+                              msg->pose.pose.position.z;
 
           double x = msg->pose.pose.orientation.x;
           double y = msg->pose.pose.orientation.y;
@@ -775,13 +833,11 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
 
           flg_get_init_guess = true;
 
+          auto euler = init_rotation.toRotationMatrix().eulerAngles(0, 1, 2);
           LOG(INFO) << YELLOW
-                  << " ---> GET Initial guess: "
+                  << " ---> GET Initial guess: pos=("
                   << init_translation.transpose()
-                  << " yaw: "
-                  << init_rotation.toRotationMatrix()
-                          .eulerAngles(0, 1, 2)
-                          .transpose()
+                  << ") rpy=(" << euler.transpose() << ")"
                   << RESET;
         });
 

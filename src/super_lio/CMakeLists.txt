@@ -28,6 +28,8 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(PCL REQUIRED)
 find_package(Glog REQUIRED)
 find_package(basic REQUIRED)
+find_package(interactive_markers REQUIRED)
+find_package(tf2 REQUIRED)
 
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -88,6 +90,19 @@ target_link_libraries(relocation_node
   ${cpp_typesupport_target}
 )
 
+add_executable(initial_pose_3d_marker src/apps/initial_pose_3d_marker.cpp)
+ament_target_dependencies(initial_pose_3d_marker
+  rclcpp
+  geometry_msgs
+  std_msgs
+  visualization_msgs
+  interactive_markers
+  tf2
+)
+target_link_libraries(initial_pose_3d_marker
+  pthread
+)
+
 install(TARGETS
   lio
   ARCHIVE DESTINATION lib
@@ -101,6 +116,11 @@ install(TARGETS
 
 install(TARGETS
   relocation_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS
+  initial_pose_3d_marker
   DESTINATION lib/${PROJECT_NAME}
 )
 
