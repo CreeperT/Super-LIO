@@ -56,11 +56,67 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<int>("lio.sensor.filter_rate", 1);
   node.get_parameter("lio.sensor.filter_rate", g_filter_rate);
 
+  node.declare_parameter<double>("lio.sensor.intensity_thresh", 200.0);
+  node.get_parameter("lio.sensor.intensity_thresh", g_intensity_thresh);
+  node.declare_parameter<double>("lio.sensor.intensity_weight", 2.0);
+  node.get_parameter("lio.sensor.intensity_weight", g_intensity_weight);
+
   node.declare_parameter<bool>("lio.sensor.enable_downsample", false);
   node.get_parameter("lio.sensor.enable_downsample", g_enable_downsample);
 
   node.declare_parameter<double>("lio.sensor.voxel_fliter_size", 0.2);
   node.get_parameter("lio.sensor.voxel_fliter_size", g_voxel_fliter_size);
+
+  if (g_voxel_fliter_size < 0.3) {
+    LOG(WARNING) << YELLOW
+                 << " ---> voxel_fliter_size=" << g_voxel_fliter_size
+                 << " < 0.3m: excessive points may cause HTVH condition "
+                 << "degeneracy and memory pressure. Recommend ≥ 0.3m."
+                 << RESET;
+  }
+
+  node.declare_parameter<double>("lio.sensor.time_offset", 0.0);
+  node.get_parameter("lio.sensor.time_offset", g_lidar1_time_offset);
+
+  // ================= second LiDAR (dual-LiDAR fusion) =================
+  node.declare_parameter<bool>("lio.lidar2.enable", false);
+  node.get_parameter("lio.lidar2.enable", g_dual_lidar_enable);
+
+  node.declare_parameter<int>("lio.lidar2.lidar_type", 1);
+  node.get_parameter("lio.lidar2.lidar_type", g_lidar_type2);
+
+  node.declare_parameter<std::string>("lio.lidar2.lidar_topic", "/livox/lidar");
+  node.get_parameter("lio.lidar2.lidar_topic", g_lidar_topic2);
+
+  double temp_range_dis2;
+  node.declare_parameter<double>("lio.lidar2.blind", 0.3);
+  node.get_parameter("lio.lidar2.blind", temp_range_dis2);
+  g_blind2_2 = temp_range_dis2 * temp_range_dis2;
+
+  node.declare_parameter<double>("lio.lidar2.maxrange", 100.0);
+  node.get_parameter("lio.lidar2.maxrange", temp_range_dis2);
+  g_maxrange2_2 = temp_range_dis2 * temp_range_dis2;
+
+  node.declare_parameter<int>("lio.lidar2.filter_rate", 3);
+  node.get_parameter("lio.lidar2.filter_rate", g_filter_rate_2);
+
+  node.declare_parameter<double>("lio.lidar2.weight", 1.0);
+  node.get_parameter("lio.lidar2.weight", g_lidar2_weight);
+
+  node.declare_parameter<double>("lio.lidar2.time_offset", 0.0);
+  node.get_parameter("lio.lidar2.time_offset", g_lidar2_time_offset);
+
+  std::vector<double> extrinsic_lidar2_imu;
+  node.declare_parameter<std::vector<double>>(
+      "lio.lidar2.extrinsic_imu", std::vector<double>(12, 0.0));
+  node.get_parameter("lio.lidar2.extrinsic_imu", extrinsic_lidar2_imu);
+  {
+    V3 t2(extrinsic_lidar2_imu[0], extrinsic_lidar2_imu[1], extrinsic_lidar2_imu[2]);
+    std::vector<scalar> r2_data(9);
+    for (int i = 0; i < 9; ++i) r2_data[i] = static_cast<scalar>(extrinsic_lidar2_imu[3 + i]);
+    M3 R2(r2_data.data());
+    g_lidar_imu2 = SE3(R2, t2);
+  }
 
   node.declare_parameter<double>("lio.sensor.gravity_norm", 9.81);
   node.get_parameter("lio.sensor.gravity_norm", g_gravity_norm);
@@ -175,6 +231,9 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<int>("lio.output.pub_step", 0);
   node.get_parameter("lio.output.pub_step", g_pub_step);
 
+  node.declare_parameter<bool>("lio.output.nav2_tf", false);
+  node.get_parameter("lio.output.nav2_tf", g_nav2_tf);
+
   // ================= relocation =================
   node.declare_parameter<bool>("lio.relocation.update_map", false);
   node.get_parameter("lio.relocation.update_map", g_update_map);
@@ -231,6 +290,58 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<double>("lio.relocation.medium_ndt_resolution", 2.0);
   node.get_parameter("lio.relocation.medium_ndt_resolution", g_reloc_medium_ndt_resolution);
+
+  // ================= online calibration (Phase 1) =================
+  node.declare_parameter<bool>("lio.calib.enable_online_calib", true);
+  node.get_parameter("lio.calib.enable_online_calib", g_enable_online_calib);
+
+  node.declare_parameter<double>("lio.calib.ext_rot_rw", 1.7e-4);
+  node.get_parameter("lio.calib.ext_rot_rw", g_calib_ext_rot_rw);
+
+  node.declare_parameter<double>("lio.calib.ext_trans_rw", 1.0e-4);
+  node.get_parameter("lio.calib.ext_trans_rw", g_calib_ext_trans_rw);
+
+  node.declare_parameter<double>("lio.calib.dt_rw", 1.0e-6);
+  node.get_parameter("lio.calib.dt_rw", g_calib_dt_rw);
+
+  // ================= edge features (point-to-line) =================
+  node.declare_parameter<bool>("lio.feature.enable_edge", true);
+  node.get_parameter("lio.feature.enable_edge", g_enable_edge_feature);
+
+  node.declare_parameter<double>("lio.feature.edge_weight", 500.0);
+  node.get_parameter("lio.feature.edge_weight", g_edge_weight);
+
+  node.declare_parameter<double>("lio.feature.edge_line_dist_thresh", 0.15);
+  node.get_parameter("lio.feature.edge_line_dist_thresh", g_edge_line_dist_thresh);
+
+  node.declare_parameter<double>("lio.feature.edge_linearity_ratio", 3.0);
+  node.get_parameter("lio.feature.edge_linearity_ratio", g_edge_linearity_ratio);
+
+  node.declare_parameter<double>("lio.feature.high_intensity_edge_boost", 3.0);
+  node.get_parameter("lio.feature.high_intensity_edge_boost", g_high_intensity_edge_boost);
+
+  // ================= degeneracy handling =================
+  node.declare_parameter<bool>("lio.degeneracy.enabled", true);
+  node.get_parameter("lio.degeneracy.enabled", g_degeneracy_enabled);
+
+  node.declare_parameter<double>("lio.degeneracy.max_stddev", 0.5);
+  node.get_parameter("lio.degeneracy.max_stddev", g_degeneracy_max_stddev);
+
+  node.declare_parameter<double>("lio.degeneracy.htvh_cond_thresh", 100.0);
+  node.get_parameter("lio.degeneracy.htvh_cond_thresh", g_degeneracy_htvh_cond_thresh);
+
+  // ================= relocation robustness =================
+  node.declare_parameter<int>("lio.relocation.init_frames", 5);
+  node.get_parameter("lio.relocation.init_frames", g_reloc_init_frames);
+
+  node.declare_parameter<double>("lio.relocation.z_search_range", 2.0);
+  node.get_parameter("lio.relocation.z_search_range", g_reloc_z_search_range);
+
+  node.declare_parameter<double>("lio.relocation.z_search_step", 1.0);
+  node.get_parameter("lio.relocation.z_search_step", g_reloc_z_search_step);
+
+  node.declare_parameter<double>("lio.relocation.min_overlap_ratio", 0.0);
+  node.get_parameter("lio.relocation.min_overlap_ratio", g_reloc_min_overlap_ratio);
 
   LOG(INFO) << GREEN << " ---> [Params]: Load from ROS2 parameter server."
             << RESET;
@@ -294,6 +405,19 @@ inline bool validPoint(double x, double y, double z)
   double d2 = x * x + y * y + z * z;
   return (d2 > g_blind2 && d2 < g_maxrange2);
 }
+
+
+bool ROSWrapper::validPoint2(double x, double y, double z)
+{
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+    return false;
+  double d2 = x * x + y * y + z * z;
+  return (d2 > g_blind2_2 && d2 < g_maxrange2_2);
+}
+
+
+// ── Dynamic time offset estimation ──────────────────────────────
+// Implementations at end of file (after stampToSec definition)
 
 
 inline double stampToSec(const builtin_interfaces::msg::Time& t)
@@ -362,6 +486,27 @@ void ROSWrapper::setupIO(){
             lidar_qos,
             std::bind(&ROSWrapper::stdMsgHandler, this, std::placeholders::_1),
             sub_opt);
+  }
+
+  // second LiDAR subscription (dual-LiDAR fusion)
+  if (g_dual_lidar_enable) {
+    if (g_lidar_type2 == LID_TYPE::LIVOX) {
+      sub_lidar2_ =
+          this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+              g_lidar_topic2,
+              lidar_qos,
+              std::bind(&ROSWrapper::livoxHandler2, this, std::placeholders::_1),
+              sub_opt);
+    } else {
+      sub_lidar2_std_ =
+          this->create_subscription<sensor_msgs::msg::PointCloud2>(
+              g_lidar_topic2,
+              lidar_qos,
+              std::bind(&ROSWrapper::stdMsgHandler2, this, std::placeholders::_1),
+              sub_opt);
+    }
+    LOG(INFO) << GREEN << " ---> [Dual-LiDAR] lidar2 subscribed: topic="
+              << g_lidar_topic2 << " type=" << g_lidar_type2 << RESET;
   }
 
   /// output ======================================
@@ -460,14 +605,16 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
 void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
   if(msg->point_num < 10) return;
+  updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
   lidar_data.pc->reserve(ptsize / g_filter_rate + 1);
 
   double offset_time = 0.0;
-  for(std::size_t _i = 0; _i < ptsize; _i += g_filter_rate){
+  for(std::size_t _i = 0; _i < ptsize; _i++){
     auto& pt = msg->points[_i];
+    if(_i % g_filter_rate != 0 && pt.reflectivity < g_intensity_thresh) continue;
     auto tag = pt.tag & 0x30;
     if (tag == 0x10 || tag == 0x00){
       auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
@@ -477,7 +624,7 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
       }
     }
   }
-  lidar_data.start_time = stampToSec(msg->header.stamp);
+  lidar_data.start_time = stampToSec(msg->header.stamp) + g_lidar1_time_offset;
   lidar_data.end_time   = lidar_data.start_time + offset_time;
   lidar_buffer_.push_back(lidar_data);
 }
@@ -485,7 +632,7 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
 
 void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
   if(msg->data.size() < 10) return;
-  
+  updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
 
@@ -501,9 +648,10 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
     const double time_begin = pl_orig.points[0].timestamp;
     lidar_data.start_time = time_begin;
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate)
+    for(std::size_t i = 0; i < pl_orig.size(); i++)
     {
       auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate != 0 && pt.intensity < g_intensity_thresh) continue;
       if (!validPoint(pt.x, pt.y, pt.z)) continue;
       offset_time = pt.timestamp - time_begin;
       lidar_data.pc->emplace_back(
@@ -537,8 +685,9 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
     lidar_data.start_time = stampToSec(msg->header.stamp);
 
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
+    for(std::size_t i = 0; i < pl_orig.size(); i++){
       auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate != 0 && pt.intensity < g_intensity_thresh) continue;
       if (!validPoint(pt.x, pt.y, pt.z)) continue;
       lidar_data.pc->emplace_back(
           pt.x, pt.y, pt.z, pt.intensity, pt.time);
@@ -553,8 +702,9 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
     lidar_data.start_time = stampToSec(msg->header.stamp);
 
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
+    for(std::size_t i = 0; i < pl_orig.size(); i++){
       auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate != 0 && pt.intensity < g_intensity_thresh) continue;
       if (!validPoint(pt.x, pt.y, pt.z)) continue;
       offset_time = pt.t * 1e-9;
       lidar_data.pc->emplace_back(
@@ -563,11 +713,204 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     lidar_data.end_time = lidar_data.start_time + offset_time;
     break;
   }
+  case LID_TYPE::LIVOX_PC2:
+  {
+    pcl::PointCloud<pcl::PointXYZI> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    if (pl_orig.empty()) break;
+
+    static bool first_log = true;
+    if (first_log) {
+      LOG(INFO) << GREEN << " ---> [LIVOX_PC2] Receiving: "
+                << pl_orig.size() << " pts/msg" << RESET;
+      first_log = false;
+    }
+
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
+    const double header_time = stampToSec(msg->header.stamp);
+    lidar_data.start_time = header_time;
+
+    for (std::size_t i = 0; i < pl_orig.size(); i++) {
+      auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate != 0 && pt.intensity < g_intensity_thresh) continue;
+      if (!validPoint(pt.x, pt.y, pt.z)) continue;
+      lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.intensity, 0.0);
+    }
+    if (lidar_data.pc->empty()) break;
+    lidar_data.end_time = header_time;
+    break;
+  }
   default:
     return;
   }
-  
+
+  lidar_data.start_time += g_lidar1_time_offset;
+  lidar_data.end_time   += g_lidar1_time_offset;
   lidar_buffer_.push_back(lidar_data);
+}
+
+
+// ── Second LiDAR handlers (dual-LiDAR) ──────────────────────────
+
+void ROSWrapper::livoxHandler2(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
+  if(msg->point_num < 10) return;
+  updateLidar2Clock(stampToSec(msg->header.stamp));
+  LidarData lidar_data;
+  std::size_t ptsize = msg->point_num;
+  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
+  lidar_data.pc->reserve(ptsize / g_filter_rate_2 + 1);
+
+  double offset_time = 0.0;
+  for(std::size_t _i = 0; _i < ptsize; _i++){
+    auto& pt = msg->points[_i];
+    if(_i % g_filter_rate_2 != 0 && pt.reflectivity < g_intensity_thresh) continue;
+    auto tag = pt.tag & 0x30;
+    if (tag == 0x10 || tag == 0x00){
+      auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+      if(dis > g_blind2_2 && dis < g_maxrange2_2){
+        offset_time = pt.offset_time * 1e-9;
+        lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.reflectivity, offset_time);
+      }
+    }
+  }
+  double offset = (lidar1_clock_valid_ && lidar2_clock_valid_)
+                      ? lidar2_dynamic_offset_ : g_lidar2_time_offset;
+  lidar_data.start_time = stampToSec(msg->header.stamp) + offset;
+  lidar_data.end_time   = lidar_data.start_time + offset_time;
+  lidar_buffer_2_.push_back(lidar_data);
+}
+
+
+void ROSWrapper::stdMsgHandler2(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
+  if(msg->data.size() < 10) return;
+  updateLidar2Clock(stampToSec(msg->header.stamp));
+
+  LidarData lidar_data;
+  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
+
+  double offset_time = 0.0;
+
+  switch (g_lidar_type2) {
+
+  case LID_TYPE::HESAI16:
+  {
+    pcl::PointCloud<hesai_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate_2 + 1);
+    const double time_begin = pl_orig.points[0].timestamp;
+    lidar_data.start_time = time_begin;
+    for(std::size_t i = 0; i < pl_orig.size(); i++)
+    {
+      auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate_2 != 0 && pt.intensity < g_intensity_thresh) continue;
+      if (!validPoint2(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.timestamp - time_begin;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, offset_time);
+    }
+    lidar_data.end_time = time_begin + offset_time;
+    break;
+  }
+  case LID_TYPE::VEL_NCLT:
+  {
+    pcl::PointCloud<NCLT::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate_2 + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate_2){
+      auto& pt = pl_orig.points[i];
+      if (!validPoint2(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.time * 1e-6;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, 1.0, offset_time);
+    }
+    lidar_data.end_time = lidar_data.start_time + offset_time;
+    break;
+  }
+  case LID_TYPE::VELO16:
+  case LID_TYPE::VELO32:
+  {
+    pcl::PointCloud<velodyne_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate_2 + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+    for(std::size_t i = 0; i < pl_orig.size(); i++){
+      auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate_2 != 0 && pt.intensity < g_intensity_thresh) continue;
+      if (!validPoint2(pt.x, pt.y, pt.z)) continue;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, pt.time);
+    }
+    lidar_data.end_time = lidar_data.start_time + lidar_data.pc->points.back().offset_time;
+    break;
+  }
+  case OUSTER:
+  {
+    pcl::PointCloud<ouster_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate_2 + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+    for(std::size_t i = 0; i < pl_orig.size(); i++){
+      auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate_2 != 0 && pt.intensity < g_intensity_thresh) continue;
+      if (!validPoint2(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.t * 1e-9;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, offset_time);
+    }
+    lidar_data.end_time = lidar_data.start_time + offset_time;
+    break;
+  }
+  case LID_TYPE::LIVOX_PC2:
+  {
+    // Use generic PointXYZI — x,y,z,intensity are standard fields
+    // that every PointCloud2 has. Custom fields (tag,line,timestamp)
+    // may have driver-specific names that don't match our PCL struct.
+    pcl::PointCloud<pcl::PointXYZI> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    if (pl_orig.empty()) {
+      static bool empty_logged = false;
+      if (!empty_logged) {
+        LOG(WARNING) << YELLOW << " ---> [LIVOX_PC2 lidar2] Deserialization produced empty cloud!"
+                     << " msg fields: " << pcl::getFieldsList(*msg)
+                     << " data size: " << msg->data.size() << RESET;
+        empty_logged = true;
+      }
+      break;
+    }
+
+    static bool first_log2 = true;
+    if (first_log2) {
+      LOG(INFO) << GREEN << " ---> [LIVOX_PC2 lidar2] Receiving: "
+                << pl_orig.size() << " pts/msg" << RESET;
+      first_log2 = false;
+    }
+
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate_2 + 1);
+    const double header_time = stampToSec(msg->header.stamp);
+    lidar_data.start_time = header_time;
+
+    for (std::size_t i = 0; i < pl_orig.size(); i++) {
+      auto& pt = pl_orig.points[i];
+      if(i % g_filter_rate_2 != 0 && pt.intensity < g_intensity_thresh) continue;
+      if (!validPoint2(pt.x, pt.y, pt.z)) continue;
+      // Mid-360 scan duration is short (~100ms); use 0 offset_time
+      lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.intensity, 0.0);
+    }
+    if (lidar_data.pc->empty()) break;
+    lidar_data.end_time = header_time;
+    break;
+  }
+  default:
+    return;
+  }
+
+  // apply clock offset correction (dynamic if initialized, static as fallback)
+  double offset = (lidar1_clock_valid_ && lidar2_clock_valid_)
+                      ? lidar2_dynamic_offset_ : g_lidar2_time_offset;
+  lidar_data.start_time += offset;
+  lidar_data.end_time   += offset;
+  lidar_buffer_2_.push_back(lidar_data);
 }
 
 
@@ -578,6 +921,7 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
 
   if (!lidar_pushed_) {
     meas.lidar = lidar_buffer_.front();
+    meas.has_lidar2 = false;
     lidar_pushed_ = true;
   }
 
@@ -585,6 +929,21 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
     lidar_buffer_.pop_front();
     lidar_pushed_ = false;
     return false;
+  }
+
+  // ── second LiDAR: retry until matched or IMU ready ──
+  // lidar2 data may arrive after lidar1; keep trying on each poll cycle.
+  if (g_dual_lidar_enable && !meas.has_lidar2 && !lidar_buffer_2_.empty()) {
+    double lidar1_start = meas.lidar.start_time;
+    double lidar1_end   = meas.lidar.end_time;
+    while (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().end_time < lidar1_start) {
+      lidar_buffer_2_.pop_front();
+    }
+    if (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().start_time <= lidar1_end) {
+      meas.lidar2 = lidar_buffer_2_.front();
+      meas.has_lidar2 = true;
+      lidar_buffer_2_.pop_front();
+    }
   }
 
   if (last_timestamp_imu_ < meas.lidar.end_time) {
@@ -673,12 +1032,36 @@ void ROSWrapper::pub_odom(const NavState& state){
 
   tf_broadcaster_->sendTransform(tf_msg);
 
-  // tf_msg.child_frame_id = "god";
-  // tf_msg.transform.rotation.x = 0.0;
-  // tf_msg.transform.rotation.y = 0.0;
-  // tf_msg.transform.rotation.z = 0.0;
-  // tf_msg.transform.rotation.w = 1.0;
-  // tf_broadcaster_->sendTransform(tf_msg);
+  // ── Nav2 TF: map → odom → base_link ──
+  if (g_nav2_tf) {
+    geometry_msgs::msg::TransformStamped map_odom_tf;
+    map_odom_tf.header.stamp = odom.header.stamp;
+    map_odom_tf.header.frame_id = "map";
+    map_odom_tf.child_frame_id = "odom";
+    map_odom_tf.transform.translation.x = 0.0;
+    map_odom_tf.transform.translation.y = 0.0;
+    map_odom_tf.transform.translation.z = 0.0;
+    map_odom_tf.transform.rotation.x = 0.0;
+    map_odom_tf.transform.rotation.y = 0.0;
+    map_odom_tf.transform.rotation.z = 0.0;
+    map_odom_tf.transform.rotation.w = 1.0;
+    tf_broadcaster_->sendTransform(map_odom_tf);
+
+    geometry_msgs::msg::TransformStamped odom_base_tf;
+    odom_base_tf.header.stamp = odom.header.stamp;
+    odom_base_tf.header.frame_id = "odom";
+    odom_base_tf.child_frame_id = "base_link";
+    odom_base_tf.transform.translation.x = robo_position[0];
+    odom_base_tf.transform.translation.y = robo_position[1];
+    odom_base_tf.transform.translation.z = robo_position[2];
+    M3 robo_rot = state.R.R_ * g_odom_robo.R_;
+    Quat robo_q(robo_rot);
+    odom_base_tf.transform.rotation.x = robo_q.x();
+    odom_base_tf.transform.rotation.y = robo_q.y();
+    odom_base_tf.transform.rotation.z = robo_q.z();
+    odom_base_tf.transform.rotation.w = robo_q.w();
+    tf_broadcaster_->sendTransform(odom_base_tf);
+  }
 
 }
 
@@ -705,6 +1088,30 @@ void ROSWrapper::pub_init_obs(const BASIC::CloudPtr& obs, const Eigen::Matrix4f&
   cloud.header.frame_id = "world";
   cloud.header.stamp = this->now();
   pub_init_obs_->publish(cloud);
+}
+
+
+void ROSWrapper::pub_plane_features(const BASIC::CloudPtr& pc){
+  static auto pub_ =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/lio/plane_features", 10);
+  sensor_msgs::msg::PointCloud2 cloud;
+  pcl::toROSMsg(*pc, cloud);
+  cloud.header.frame_id = "world";
+  cloud.header.stamp = this->now();
+  pub_->publish(cloud);
+}
+
+
+void ROSWrapper::pub_edge_features(const BASIC::CloudPtr& pc){
+  static auto pub_ =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/lio/edge_features", 10);
+  sensor_msgs::msg::PointCloud2 cloud;
+  pcl::toROSMsg(*pc, cloud);
+  cloud.header.frame_id = "world";
+  cloud.header.stamp = this->now();
+  pub_->publish(cloud);
 }
 
 
@@ -843,6 +1250,51 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
 
   if (flg_finish_init) {
     init_pose_sub.reset();
+  }
+}
+
+
+// ── Dynamic time offset estimation (implementations) ────────────
+// clock = header_stamp - system_receive_time
+// offset = clock1 - clock2 (add to lidar2 to align with lidar1 reference)
+
+void ROSWrapper::updateLidar1Clock(double hdr_stamp) {
+  double sys = stampToSec(this->now());
+  lidar1_clock_ = hdr_stamp - sys;
+  lidar1_clock_valid_ = true;
+
+  if (lidar2_clock_valid_) {
+    double raw = lidar1_clock_ - lidar2_clock_;
+    double alpha = 0.02;
+    lidar2_dynamic_offset_ = alpha * raw + (1.0 - alpha) * lidar2_dynamic_offset_;
+    static bool first_update = true;
+    if (first_update) {
+      lidar2_dynamic_offset_ = raw;
+      LOG(INFO) << GREEN << " ---> [DynOffset] Initialized: clock1=" << lidar1_clock_
+                << " clock2=" << lidar2_clock_
+                << " offset=" << lidar2_dynamic_offset_ << RESET;
+      first_update = false;
+    }
+  }
+}
+
+void ROSWrapper::updateLidar2Clock(double hdr_stamp) {
+  double sys = stampToSec(this->now());
+  lidar2_clock_ = hdr_stamp - sys;
+  lidar2_clock_valid_ = true;
+
+  if (lidar1_clock_valid_) {
+    double raw = lidar1_clock_ - lidar2_clock_;
+    double alpha = 0.02;
+    lidar2_dynamic_offset_ = alpha * raw + (1.0 - alpha) * lidar2_dynamic_offset_;
+    static bool first_update2 = true;
+    if (first_update2) {
+      lidar2_dynamic_offset_ = raw;
+      LOG(INFO) << GREEN << " ---> [DynOffset] Initialized: clock1=" << lidar1_clock_
+                << " clock2=" << lidar2_clock_
+                << " offset=" << lidar2_dynamic_offset_ << RESET;
+      first_update2 = false;
+    }
   }
 }
 

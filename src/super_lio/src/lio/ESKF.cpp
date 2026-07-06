@@ -1,4 +1,5 @@
 #include "lio/ESKF.h"
+#include "basic/logs.h"
 
 using namespace BASIC;
 
@@ -44,9 +45,9 @@ M3d A_matrix(const V3 & v){
 }
 
 
-void ESKF::SetInitialConditions(Options options, const V3& init_bg, 
+void ESKF::SetInitialConditions(Options options, const V3& init_bg,
                                 const V3& init_ba, const float imu_scale,
-                                const V3& gravity) 
+                                const V3& gravity)
 {
   BuildNoise(options);
   options_ = options;
@@ -55,20 +56,38 @@ void ESKF::SetInitialConditions(Options options, const V3& init_bg,
   g_ = gravity;
   imu_scale_ = imu_scale;
 
-  P_ = 1e-4 * M18::Identity();
+  P_.setIdentity();
+  P_ *= 1e-4;
   P_.template block<3, 3>(0, 0) = 0.1 * M_PI / 180.0 * M3::Identity();   // r
+  P_.template block<3, 3>(12, 12) = 1e-2 * M3::Identity();                // ba: σ=0.1 m/s²
 
+  // ── Phase 1: calibration initial uncertainty ──
+  // Extrinsic rotation: 1° (generous initial guess from manual measurement)
+  P_.template block<3, 3>(18, 18) = std::pow(3.0 * M_PI / 180.0, 2) * M3::Identity();  // ext1 rot
+  P_.template block<3, 3>(21, 21) = std::pow(0.10, 2) * M3::Identity();                // ext1 trans: 10cm
+  P_.template block<3, 3>(24, 24) = std::pow(3.0 * M_PI / 180.0, 2) * M3::Identity();  // ext2 rot
+  P_.template block<3, 3>(27, 27) = std::pow(0.10, 2) * M3::Identity();                // ext2 trans: 10cm
+  // Time offset: 5ms uncertainty
+  P_(30, 30) = std::pow(5e-3, 2);
+  P_(31, 31) = std::pow(5e-3, 2);
+
+  // Init calibration nominal from globals
+  T_L1_IMU_ = g_lidar_imu;
+  T_L2_IMU_ = g_lidar_imu2;
+  delta_t1_ = g_lidar1_time_offset;
+  delta_t2_ = g_lidar2_time_offset;
 }
 
 
 void ESKF::SetX(const SysState& x) {
-  last_imu_time_ = x.timestamp;      // TODO: The timestamp update is not strictly consistent.
+  last_imu_time_ = x.timestamp;
   current_time_ = last_imu_time_;
   R_ = x.R;
   p_ = x.p;
   v_ = x.v;
   bg_ = x.bg;
   ba_ = x.ba;
+  // calib: keep current values (set by SetInitialConditions or online estimation)
   fw_R_ = R_;
   fw_p_ = p_;
   fw_v_ = v_;
@@ -93,16 +112,138 @@ void ESKF::BuildNoise(const Options& options) {
                    ea2, ea2, ea2;    // nba: ba -> a -> v -> p
 }
 
+void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
+  if (!degen_opts_.enabled) {
+    degen_detected_ = false;
+    return;
+  }
+
+  // ── Compute current degeneracy metrics ──
+  M3d HTVH_trans = HTVH.block<3,3>(3,3).cast<double>();
+  Eigen::SelfAdjointEigenSolver<M3d> eig_H(HTVH_trans);
+  V3d ev_H = eig_H.eigenvalues();
+  double cond_H = (ev_H(2) > 1e-10) ? ev_H(2) / (ev_H(0) + 1e-10) : 0.0;
+
+  bool currently_degenerate = (cond_H > degen_opts_.htvh_cond_thresh);
+
+  // ── Recovery detection ──
+  // When geometry improves (κ drops), count consecutive normal frames.
+  // After N frames of good geometry, enter recovery: skip projection
+  // and inflate P translation block to let observations pull the state back.
+  static constexpr int RECOVERY_CONFIRM = 5;   // frames to confirm exit from degeneracy
+  static constexpr int RECOVERY_FRAMES   = 10;  // frames of recovery boost
+
+  if (!currently_degenerate) {
+    recovery_confirm_count_++;
+    if (recovery_confirm_count_ >= RECOVERY_CONFIRM &&
+        recovery_remaining_ == 0 && was_degenerate_) {
+      // Enter recovery mode
+      recovery_remaining_ = RECOVERY_FRAMES;
+      LOG(INFO) << GREEN << "[ESKF] Degeneracy recovery triggered — "
+                << "geometry restored after " << recovery_confirm_count_
+                << " normal frames, boosting observation for "
+                << RECOVERY_FRAMES << " frames" << RESET;
+      // Inflate P translation block to 1.0 m² — let observations dominate
+      P_.block<3,3>(3,3) += M3::Identity() * scalar(1.0);
+    }
+  } else {
+    recovery_confirm_count_ = 0;
+    consecutive_degen_frames_++;
+  }
+
+  if (!currently_degenerate) {
+    consecutive_degen_frames_ = 0;
+    reset_map_requested_ = false;
+  }
+
+  // ── Map reset trigger: persistent degeneracy ──
+  static constexpr int MAP_RESET_DEGEN_FRAMES = 100;
+  if (consecutive_degen_frames_ > MAP_RESET_DEGEN_FRAMES && !reset_map_requested_) {
+    reset_map_requested_ = true;
+    LOG(WARNING) << "[ESKF] Persistent degeneracy " << consecutive_degen_frames_
+                 << " frames — map reset requested";
+  }
+
+  if (recovery_remaining_ > 0) {
+    recovery_remaining_--;
+    degen_detected_ = false;
+    was_degenerate_ = (recovery_remaining_ == 0) ? false : was_degenerate_;
+    // During recovery: allow full dx (no projection), P already inflated
+    return;
+  }
+
+  was_degenerate_ = currently_degenerate;
+  degen_detected_ = false;
+
+  // ── Check 1: posterior stddev ──
+  Eigen::SelfAdjointEigenSolver<M3d> eig_Q(Q_trans.cast<double>());
+  V3d ev_Q = eig_Q.eigenvalues();
+  M3d V_f = M3d::Zero();
+  int sigma_count = 0;
+  for (int i = 0; i < 3; i++) {
+    double stddev = std::sqrt(std::max(0.0, ev_Q(i)));
+    if (stddev > degen_opts_.max_trans_stddev) {
+      V_f += eig_Q.eigenvectors().col(i) * eig_Q.eigenvectors().col(i).transpose();
+      sigma_count++;
+    }
+  }
+
+  // ── Check 2: HTVH condition number ──
+  int cond_count = 0;
+  if (currently_degenerate) {
+    cond_count = 1;
+    V3d weak_dir = eig_H.eigenvectors().col(0);
+    V_f += weak_dir * weak_dir.transpose();
+  }
+
+  // ── Apply projection ──
+  if (sigma_count > 0 || cond_count > 0) {
+    degen_detected_ = true;
+
+    Eigen::SelfAdjointEigenSolver<M3d> eig_F(V_f);
+    V3d ev_F = eig_F.eigenvalues();
+    M3d V_f_clamped = M3d::Zero();
+    for (int i = 0; i < 3; i++) {
+      double clamped = std::min(ev_F(i), 1.0);
+      V_f_clamped += clamped * eig_F.eigenvectors().col(i) * eig_F.eigenvectors().col(i).transpose();
+    }
+
+    V3d dx_trans = dx.segment<3>(3).cast<double>();
+    dx_trans = (M3d::Identity() - V_f_clamped) * dx_trans;
+    dx.segment<3>(3) = dx_trans.cast<scalar>();
+
+    if (sigma_count > 0) {
+      LOG(WARNING) << "[ESKF] Degeneracy (σ): " << sigma_count
+                   << "/3 dims, σ=[" << std::sqrt(std::max(0.0, ev_Q(0)))
+                   << ", " << std::sqrt(std::max(0.0, ev_Q(1)))
+                   << ", " << std::sqrt(std::max(0.0, ev_Q(2))) << "]m"
+                   << " > " << degen_opts_.max_trans_stddev << "m";
+    }
+    if (cond_count > 0) {
+      LOG(WARNING) << "[ESKF] Degeneracy (κ): HTVH_trans κ=" << cond_H
+                   << " > " << degen_opts_.htvh_cond_thresh
+                   << " | ev_H=[" << ev_H(0) << ", " << ev_H(1) << ", " << ev_H(2) << "]"
+                   << " | suppressed weakest direction";
+    }
+  }
+}
+
+
 void ESKF::Update() {
   R_ = R_ * SO3::Exp(dx_.template block<3, 1>(0, 0));
   p_ += dx_.template block<3, 1>(3, 0);
   v_ += dx_.template block<3, 1>(6, 0);
 
-  bg_ += dx_.template block<3, 1>(9, 0);
-  ba_ += dx_.template block<3, 1>(12, 0);
+  // Freeze bg/ba during degeneracy — unobservable directions only contain noise
+  if (!degen_detected_) {
+    bg_ += dx_.template block<3, 1>(9, 0);
+    ba_ += dx_.template block<3, 1>(12, 0);
+  }
 
   g_ += dx_.template block<3, 1>(15, 0);
   g_ = g_gravity_norm * (g_.normalized());
+
+  // Calibration update is handled separately in UpdateObserve (block-diagonal)
 
   fw_R_ = R_;
   fw_p_ = p_;
@@ -214,6 +355,32 @@ bool ESKF::Predict(const IMUData& imu) {
 
   P_ = f_x * P_ * f_x.transpose() + f_w * Q_ * f_w.transpose();
 
+  // ── Phase 1: calibration random walk noise ──
+  if (calib_enabled_) {
+    double dts = std::max(0.0, dt);
+    scalar ext_rot_rw   = scalar(g_calib_ext_rot_rw   * std::sqrt(dts));
+    scalar ext_trans_rw = scalar(g_calib_ext_trans_rw * std::sqrt(dts));
+    scalar dt_rw        = scalar(g_calib_dt_rw        * std::sqrt(dts));
+    for (int i = 0; i < 3; i++) {
+      P_(18+i, 18+i) += ext_rot_rw * ext_rot_rw;
+      P_(21+i, 21+i) += ext_trans_rw * ext_trans_rw;
+      P_(24+i, 24+i) += ext_rot_rw * ext_rot_rw;
+      P_(27+i, 27+i) += ext_trans_rw * ext_trans_rw;
+    }
+    P_(30, 30) += dt_rw * dt_rw;
+    P_(31, 31) += dt_rw * dt_rw;
+  }
+
+  // P lower bounds — COMMENTED OUT: may cause systematic drift on return legs
+  // scalar p_min_pred_trans = degen_detected_ ? scalar(0.09) : scalar(2.5e-3);
+  // scalar p_min_pred_rot   = scalar(3.0e-6);
+  // for (int i = 3; i < 6; i++) {
+  //   if (P_(i, i) < p_min_pred_trans) P_(i, i) = p_min_pred_trans;
+  // }
+  // for (int i = 0; i < 3; i++) {
+  //   if (P_(i, i) < p_min_pred_rot) P_(i, i) = p_min_pred_rot;
+  // }
+
   global_acc_ = R_.R() * acc + g_;
   p_ = p_ + v_ * dt + 0.5 * global_acc_ * dt * dt;
   v_ = v_ + global_acc_ * dt;
@@ -225,13 +392,16 @@ bool ESKF::Predict(const IMUData& imu) {
 }
 
 
-const int STATE_DIM = 18;
+const int STATE_DIM = ESKF::STATE_DIM_;  // keep for backward compat in RemapDegeneracy
 bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   SO3 R_0 = R_;
 
-  M6 HTVH;     // H^T * V^(-1) * H
-  V6 HTVr;     // H^T * V^(-1) * residuals
-  M18 Pk, Qk;
+  M6  HTVH_pose;
+  V6  HTVr_pose;
+  OBS_MAT HTVH_calib;
+  OBS_VEC HTVr_calib;
+
+  COV Pk, Qk;
 
   need_converge_ = false;
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
@@ -239,45 +409,47 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       need_converge_ = true;
     }
 
-    obs(GetKFState(), HTVH, HTVr);
-    /**
-     * J = diag(I_3, I_3, J_theta, I_3, I_3, I_3)
-     * J_theta = I - 1/2 * δθ_k ∧
-     * δθ_k = Log(R_k^T * R_0)  ?  --> Log(R_0^T * R_k) ?
-     */
+    HTVH_pose.setZero(); HTVr_pose.setZero();
+    HTVH_calib.setZero(); HTVr_calib.setZero();
+
+    obs(GetKFState(), HTVH_pose, HTVr_pose, HTVH_calib, HTVr_calib);
+
+    // J_theta: error-state Jacobian for rotation re-parameterization
     Pk = P_;
     M3 J_theta = M3::Identity() - 0.5 * SO3::hat((R_0.inverse() * R_).log_vee());
-    for(int j = 0; j < STATE_DIM; j+=3){
+    // Apply J_theta only to the rotation row (0) and column (0)
+    for(int j = 0; j < STATE_DIM_; j+=3){
       Pk.block<3,3>(0, j).noalias() = J_theta * P_.block<3,3>(0, j);
     }
-    for(int j = 0; j < STATE_DIM; j+=3){
+    for(int j = 0; j < STATE_DIM_; j+=3){
       Pk.block<3,3>(j, 0) = Pk.block<3,3>(j, 0) * J_theta.transpose();
     }
 
-    /**
-     * The normal Kalman filter formula: 
-     * K_k = P_k * H_k^T * (H_k * P_k * H_k^T + V)^(-1)
-     * δx_k = K_k * (z - h(x_k))
-     * 
-     * Using SMW identity transformation：
-     * (A * B * (D + C * A * B)^(-1)) = ((A^(-1) + B * D^(-1) * C)^(-1) * B * D^(-1))
-     * K_k = (P_k^(-1) + H_k^T * V^(-1) * H_k)^(-1) * H_k^T * V^(-1)
-     * Q_k = (P_k^(-1) + H_k^T * V^(-1) * H_k)^(-1)
-     * HTVr = H_k^T * V^(-1) * residuals
-     * residuals = (z - h(x_k))
-     */
+    // SMW: Pk_inv = P⁻¹, then add HᵀWH
+    COV Pk_inv = Pk.inverse();
 
-    M18 Pk_inv = Pk.inverse();
-    Pk_inv.block<6,6>(0,0) += HTVH;
+    // ── Map observation into Pk_inv ──
+    // Pose block (always)
+    Pk_inv.block<6,6>(0,0) += HTVH_pose;
+
+    // ── Phase 1: block-diagonal approximation ──
+    // Pose solved in 33×33 (well-conditioned: P is block-diagonal).
+    // Calibration solved separately after IEKF loop (15×15 system).
 
     Qk = Pk_inv.inverse();
 
-    V18 error_dx = V18::Zero();
-    error_dx.head(6) = HTVr;
+    STATE error_dx = STATE::Zero();
+    error_dx.template block<6,1>(0, 0) = HTVr_pose;
 
+    // Pose-only solve: calib blocks are decoupled (block-diagonal approx).
+    // P is block-diagonal (pose ⟂ calib), so the 33×33 inverse is well-conditioned.
+    Qk = Pk_inv.inverse();
     dx_ = Qk * error_dx;
 
-    // update norm state
+    // solution remapping for degeneracy (uses posterior translation covariance + HTVH condition)
+    RemapDegeneracy(Qk.block<3, 3>(3, 3), HTVH_pose, dx_);
+
+    // update norm state (includes calibration)
     Update();
 
     if (dx_.lpNorm<Eigen::Infinity>() < options_.quit_eps_ && iter > 0) {
@@ -285,27 +457,106 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
   }
 
-  // update P
-  M18 temp_cov = M18::Identity();
-  temp_cov.block<6,6>(0,0) = HTVH;
-  P_ = (M18::Identity() - Qk * temp_cov) * Pk;
+  // update P: Joseph form P = (I - K*H) * P * (I - K*H)ᵀ + K*R*Kᵀ
+  // P update (pose block only)
+  COV temp_cov = COV::Zero();
+  temp_cov.block<6,6>(0,0) = HTVH_pose;
+  P_ = (COV::Identity() - Qk * temp_cov) * Pk;
+
+  // ── Phase 1: separate calibration update (block-diagonal, after pose converged) ──
+  if (calib_enabled_) {
+    // Extract calibration sub-blocks from P
+    Eigen::Matrix<scalar, 15, 15> P_calib = P_.block<15,15>(18, 18);
+    Eigen::Matrix<scalar, 15, 15> S_calib = P_calib.inverse();
+    S_calib += HTVH_calib.block<15,15>(6, 6).cast<scalar>();
+
+    Eigen::Matrix<scalar, 15, 1> dx_calib =
+        S_calib.ldlt().solve(HTVr_calib.template block<15,1>(6, 0).cast<scalar>());
+
+    // Un-normalise rotation corrections: dθ_true = dθ_norm / s0
+    if (calib_s0_ > 1.0) {
+      scalar inv_s0 = scalar(1.0 / calib_s0_);
+      dx_calib.template segment<3>(0) *= inv_s0;  // ext1 rot
+      dx_calib.template segment<3>(6) *= inv_s0;  // ext2 rot
+    }
+
+    // Apply calibration update
+    V6 dxi1;
+    dxi1 << dx_calib.template segment<3>(0), dx_calib.template segment<3>(3);
+    T_L1_IMU_.updateRhs(dxi1);
+
+    V6 dxi2;
+    dxi2 << dx_calib.template segment<3>(6), dx_calib.template segment<3>(9);
+    T_L2_IMU_.updateRhs(dxi2);
+
+    delta_t1_ += dx_calib(12);
+    delta_t2_ += dx_calib(13);
+
+    // Debug: print calibration correction every frame
+    static int calib_dbg = 0;
+    if (++calib_dbg <= 5 || calib_dbg % 200 == 0) {
+      scalar deg1 = dx_calib.template segment<3>(0).norm() * 180.0 / M_PI;
+      scalar deg2 = dx_calib.template segment<3>(6).norm() * 180.0 / M_PI;
+      LOG(INFO) << "[CalibUpdate#" << calib_dbg
+                << "] |dθ1|=" << deg1 << "° |dt1|=" << dx_calib.template segment<3>(3).norm() << "m"
+                << " |dθ2|=" << deg2 << "° |dt2|=" << dx_calib.template segment<3>(9).norm() << "m"
+                << " s0=" << calib_s0_;
+    }
+
+    // Update calibration covariance (Joseph form)
+    Eigen::Matrix<scalar, 15, 15> K_calib = S_calib.ldlt().solve(
+        Eigen::Matrix<scalar, 15, 15>::Identity());
+    P_.block<15,15>(18, 18) = (Eigen::Matrix<scalar, 15, 15>::Identity()
+                                - K_calib * HTVH_calib.block<15,15>(6, 6).cast<scalar>())
+                               * P_calib;
+  }
 
   Pk = P_;
 
-  // project P
+  // project P with J_theta
   M3 J_theta = M3::Identity() - 0.5 * SO3::hat(dx_.template block<3, 1>(0, 0));
-  for(int j = 0; j < STATE_DIM; j+=3){
+  for(int j = 0; j < STATE_DIM_; j+=3){
     Pk.block<3,3>(0, j).noalias() = J_theta * P_.block<3,3>(0, j);
   }
-  for(int j = 0; j < STATE_DIM; j+=3){
+  for(int j = 0; j < STATE_DIM_; j+=3){
     Pk.block<3,3>(j, 0) = Pk.block<3,3>(j, 0) * J_theta.transpose();
   }
 
   P_ = Pk;
 
+  // P lower bounds — COMMENTED OUT: may cause systematic drift on return legs
+  // {
+  //   scalar p_min_trans = degen_detected_ ? scalar(0.09) : scalar(2.5e-3);
+  //   scalar p_min_rot   = scalar(3.0e-6);
+  //   for (int i = 3; i < 6; i++) {
+  //     if (P_(i, i) < p_min_trans) P_(i, i) = p_min_trans;
+  //   }
+  //   for (int i = 0; i < 3; i++) {
+  //     if (P_(i, i) < p_min_rot) P_(i, i) = p_min_rot;
+  //   }
+  // }
+
   dx_.setZero();
-  
+
   last_obs_time_ = current_obs_time_;
+
+  // ── Map-conflict detection ──
+  // |HTVr| spikes when revisiting areas with drifted map points.
+  {
+    static int conflict_count = 0;
+    float r_norm = HTVr_pose.norm();
+    if (r_norm > 5000) {
+      conflict_count++;
+      if (conflict_count > 20 && !reset_map_requested_) {
+        reset_map_requested_ = true;
+        LOG(WARNING) << "[ESKF] Map conflict detected — |HTVr|=" << r_norm
+                     << " for " << conflict_count << " frames";
+      }
+    } else {
+      conflict_count = 0;
+    }
+  }
+
   return true;
 }
 

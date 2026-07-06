@@ -65,6 +65,7 @@ protected:
   bool flg_first_scan_ = true;
   std::vector<DynamicState> propagate_states_;
   BASIC::CloudPtr scan_undistort_full_;
+  BASIC::CloudPtr scan_undistort_full_2_;   // second LiDAR deskewed cloud
   BASIC::CloudPtr ds_undistort_;
   BASIC::CloudPtr point_map_, world_pc_, ds_world_;
   int frame_num_ = 0;
@@ -73,12 +74,16 @@ protected:
 
   std::size_t effect_knn_num_ = 0;
   BASIC::VV3 points_world_v3_, points_body_v3_;
-  alignas(64) bool effect_mask_[20000] = {false};
-  alignas(64) bool effect_knn_mask_[20000] = {false};
+  std::vector<char> effect_mask_;       // dynamic: resized per frame
+  std::vector<char> effect_knn_mask_;   // dynamic: resized per frame
   std::vector<int> effect_knn_idxs_;
   std::vector<std::pair<BASIC::M6, BASIC::V6>> H_R_;
   std::vector<std::array<double, 4>> abcd_vec_;
+  std::vector<char> edge_mask_;         // dynamic: resized per frame
+  std::vector<BASIC::V3> line_dir_vec_;
+  std::vector<BASIC::V3> line_center_vec_;
   int pcd_index_ = -1;
+  int skip_observe_frames_ = 0;  // frames to skip Observe after map reset
 
   Timer time_record_;
 };

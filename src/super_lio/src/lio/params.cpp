@@ -28,8 +28,22 @@ namespace LI2Sup{
   float  g_blind2;
   float  g_maxrange2;
   int    g_filter_rate;
+  float  g_intensity_thresh = 200.0f;   // keep all points above this (max ~255)
+  float  g_intensity_weight = 2.0f;     // extra weight factor for high-intensity
   bool   g_enable_downsample;
   float  g_voxel_fliter_size;
+  double g_lidar1_time_offset = 0.0;
+
+  /// second LiDAR (dual-LiDAR fusion)
+  bool   g_dual_lidar_enable = false;
+  int    g_lidar_type2 = 1;         // default: Livox Mid-360
+  std::string g_lidar_topic2 = "/livox/lidar";
+  SE3    g_lidar_imu2;
+  float  g_blind2_2 = 0.09f;        // 0.3^2
+  float  g_maxrange2_2 = 10000.0f;  // 100^2
+  int    g_filter_rate_2 = 3;
+  double g_lidar2_weight = 1.0;
+  double g_lidar2_time_offset = 0.0;
 
   int    g_imu_type;
   double g_gravity_norm = 9.7946;
@@ -64,11 +78,30 @@ namespace LI2Sup{
   bool g_visual_map = true;
   bool g_visual_dense = false;
   int  g_pub_step;
+  bool g_nav2_tf    = false;
 
   /// for planner
   bool g_planner_enable;
 
   ResidualType g_residual_type = PROB;
+
+  /// online calibration
+  bool   g_enable_online_calib = true;
+  double g_calib_ext_rot_rw   = 1.7e-4;   // ~0.01°/√s
+  double g_calib_ext_trans_rw = 1.0e-4;   // ~0.1mm/√s
+  double g_calib_dt_rw        = 1.0e-6;   // ~1μs/√s
+
+  /// edge (point-to-line) feature
+  bool   g_enable_edge_feature = true;
+  double g_edge_weight = 100.0;
+  double g_edge_line_dist_thresh = 0.05;
+  double g_edge_linearity_ratio = 5.0;
+  double g_high_intensity_edge_boost = 3.0;
+
+  /// degeneracy handling
+  bool   g_degeneracy_enabled = true;
+  double g_degeneracy_max_stddev = 0.5;        // meters
+  double g_degeneracy_htvh_cond_thresh = 100.0;
 
   /// for relocation
   bool g_update_map = false;
@@ -90,5 +123,11 @@ namespace LI2Sup{
   double g_reloc_medium_ds_size = 0.8;
   double g_reloc_medium_ndt_resolution = 2.0;
   bool   g_reloc_enable_multi_res = true;
+
+  /// relocation robustness
+  int    g_reloc_init_frames = 5;
+  double g_reloc_z_search_range = 2.0;
+  double g_reloc_z_search_step = 1.0;
+  double g_reloc_min_overlap_ratio = 0.0;
 
 }

@@ -41,12 +41,26 @@ namespace LI2Sup{
   extern std::string g_imu_topic;
   extern std::string g_lidar_topic;
 
-  extern int   g_lidar_type;       // 1: mid360, 2: hesai16, 3: velo16, 4: velo32, 5: vel_nclt, 6: ls16 
+  extern int   g_lidar_type;       // 1: mid360, 2: hesai16, 3: velo16, 4: velo32, 5: vel_nclt, 6: ls16
   extern float g_blind2;
   extern float g_maxrange2;
   extern int   g_filter_rate;
+  extern float g_intensity_thresh;   // keep all points above this intensity
+  extern float g_intensity_weight;   // extra weight multiplier for high-intensity points
   extern bool  g_enable_downsample;
   extern float g_voxel_fliter_size;
+  extern double g_lidar1_time_offset;   // clock correction for lidar1 (seconds)
+
+  /// second LiDAR (dual-LiDAR fusion)
+  extern bool   g_dual_lidar_enable;
+  extern int    g_lidar_type2;
+  extern std::string g_lidar_topic2;
+  extern BASIC::SE3 g_lidar_imu2;
+  extern float  g_blind2_2;
+  extern float  g_maxrange2_2;
+  extern int    g_filter_rate_2;
+  extern double g_lidar2_weight;        // observation weight relative to lidar1 (1.0 = equal)
+  extern double g_lidar2_time_offset;   // clock correction: lidar2_time + offset = imu_time (seconds)
 
   extern int    g_imu_type;
   extern double g_gravity_norm;
@@ -81,6 +95,7 @@ namespace LI2Sup{
   extern bool g_visual_map;
   extern bool g_visual_dense;
   extern int  g_pub_step;
+  extern bool g_nav2_tf;    // publish map→odom→base_link for Nav2
 
   /// for planner
   extern bool g_planner_enable;
@@ -93,6 +108,23 @@ namespace LI2Sup{
   };
   extern ResidualType g_residual_type;
 
+  /// online calibration
+  extern bool   g_enable_online_calib;
+  extern double g_calib_ext_rot_rw;    // extrinsic rotation random walk (rad/√s)
+  extern double g_calib_ext_trans_rw;  // extrinsic translation random walk (m/√s)
+  extern double g_calib_dt_rw;         // time offset random walk (s/√s)
+
+  /// edge (point-to-line) feature
+  extern bool   g_enable_edge_feature;
+  extern double g_edge_weight;
+  extern double g_edge_line_dist_thresh;   // max distance to fitted line (neighbors & scan point)
+  extern double g_edge_linearity_ratio;    // λ_max / λ_2nd > this in fit_line_from_points
+  extern double g_high_intensity_edge_boost;  // extra multiplier for high-intensity edge features
+
+  /// degeneracy handling
+  extern bool   g_degeneracy_enabled;
+  extern double g_degeneracy_max_stddev;       // posterior σ > this (meters) → degenerate
+  extern double g_degeneracy_htvh_cond_thresh; // HTVH trans κ > this → constraint imbalance
 
   /// for relocation
   extern bool g_update_map;
@@ -114,6 +146,12 @@ namespace LI2Sup{
   extern double g_reloc_medium_ds_size;         // medium stage: target downsample leaf
   extern double g_reloc_medium_ndt_resolution;  // medium stage: NDT voxel resolution
   extern bool   g_reloc_enable_multi_res;       // enable multi-resolution cascade
+
+  /// relocation robustness
+  extern int    g_reloc_init_frames;         // number of lidar frames to accumulate for relocation
+  extern double g_reloc_z_search_range;      // ±z range for fallback search (meters)
+  extern double g_reloc_z_search_step;       // z step for fallback search (meters)
+  extern double g_reloc_min_overlap_ratio;   // minimum ICP inlier ratio (0-1), 0=disabled
 
 }
 

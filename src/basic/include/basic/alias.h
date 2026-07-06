@@ -14,6 +14,27 @@
  #include <Eigen/Geometry>
  #include <pcl/point_types.h>
  #include <pcl/point_cloud.h>
+
+namespace livox_pc2 {
+struct EIGEN_ALIGN16 Point {
+    PCL_ADD_POINT4D
+    float intensity;
+    uint8_t tag;
+    uint8_t line;
+    double timestamp;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+}
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_pc2::Point,
+                                  (float, x, x)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (float, intensity, intensity)
+                                  (std::uint8_t, tag, tag)
+                                  (std::uint8_t, line, line)
+                                  (double, timestamp, timestamp)
+                                  )
  
  namespace velodyne_ros {
  struct EIGEN_ALIGN16 Point {

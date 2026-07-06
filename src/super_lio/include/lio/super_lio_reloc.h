@@ -33,8 +33,11 @@ private:
 
 private:
   BASIC::CloudPtr init_obs_data_;
+  BASIC::CloudPtr init_obs_data2_;   // lidar2 points for separate extrinsic transform
   bool flg_get_init_guess_ = false;
   BASIC::SE3 re_init_pose_;
+  float map_z_min_ = 0.0f;
+  float map_z_max_ = 0.0f;
 };
 
 } // namespace END.

@@ -12,13 +12,19 @@ namespace LI2Sup{
 class ESKF {
 public:
   using Ptr   = std::shared_ptr<ESKF>;
-                                                  //         0 3 6 9 12 15
-  using STATE = Eigen::Matrix<BASIC::scalar, 18, 1>;     //Flatten: R p v bg ba g. 
-  using STATE_DOF = Eigen::Matrix<BASIC::scalar, 17, 1>; //Flatten: R p v bg ba g_2.
-  using NOISE = Eigen::Matrix<BASIC::scalar, 12, 12>;
-  using COV   = Eigen::Matrix<BASIC::scalar, 18, 18>;
-  using F_X   = Eigen::Matrix<BASIC::scalar, 18, 18>;
-  using F_W   = Eigen::Matrix<BASIC::scalar, 18, 12>;
+
+  static constexpr int CORE_DIM   = 18;  // R(3) p(3) v(3) bg(3) ba(3) g(3)
+  static constexpr int EXTRIN_DIM = 12;  // T_ext1(6) T_ext2(6)
+  static constexpr int TIME_DIM   = 3;   // dt1(1) dt2(1) + padding
+  static constexpr int STATE_DIM_ = CORE_DIM + EXTRIN_DIM + TIME_DIM;  // 33
+  static constexpr int OBS_DIM    = 6 + EXTRIN_DIM + TIME_DIM;         // 21
+
+  using STATE = Eigen::Matrix<BASIC::scalar, STATE_DIM_, 1>;
+  using STATE_DOF = Eigen::Matrix<BASIC::scalar, 17, 1>;
+  using NOISE = Eigen::Matrix<BASIC::scalar, 12, 12>;       // unchanged: IMU noise only
+  using COV   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, STATE_DIM_>;
+  using F_X   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, STATE_DIM_>;
+  using F_W   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, 12>;
 
 
   struct Options {
@@ -36,6 +42,16 @@ public:
   struct KFState{
     bool need_converge = true;
     BASIC::SE3  pose;
+    BASIC::SE3  T_L1_IMU;   // LiDAR1→IMU extrinsic (nominal)
+    BASIC::SE3  T_L2_IMU;   // LiDAR2→IMU extrinsic (nominal)
+    double      dt1 = 0.0;  // LiDAR1 time offset (nominal)
+    double      dt2 = 0.0;  // LiDAR2 time offset (nominal)
+  };
+
+  struct DegeneracyOptions {
+    bool enabled = true;
+    double max_trans_stddev = 0.5;   // posterior σ > this (meters) → degenerate
+    double htvh_cond_thresh = 100.0; // HTVH trans block condition number > this → degenerate
   };
 
 
@@ -54,7 +70,12 @@ public:
 
   bool Predict(const IMUData& imu);
 
-  using ObsFunc = std::function<void(const KFState& kf_state, BASIC::M6& HT_Vinv_H, BASIC::V6& HT_Vinv_r)>;
+  // Observation return: pose(6) + calib(EXTRIN_DIM+TIME_DIM) = OBS_DIM
+  using OBS_MAT = Eigen::Matrix<BASIC::scalar, OBS_DIM, OBS_DIM>;
+  using OBS_VEC = Eigen::Matrix<BASIC::scalar, OBS_DIM, 1>;
+  using ObsFunc = std::function<void(const KFState& kf_state,
+                                      BASIC::M6& HTVH_pose, BASIC::V6& HTVr_pose,
+                                      OBS_MAT& HTVH_calib, OBS_VEC& HTVr_calib)>;
   bool UpdateObserve(ObsFunc obs);
 
   double GetTime() const { return current_time_; }
@@ -65,7 +86,9 @@ public:
 
   DynamicState GetDynamicState() const { return DynamicState(current_time_, R_.R_, p_, v_, body_omega_, global_acc_); }
 
-  KFState GetKFState() const { return KFState{need_converge_, GetSE3()}; }
+  KFState GetKFState() const {
+    return KFState{need_converge_, GetSE3(), T_L1_IMU_, T_L2_IMU_, delta_t1_, delta_t2_};
+  }
 
   Pose_t   GetPoseT() const { return Pose_t(current_time_, R_, p_); }
 
@@ -80,6 +103,20 @@ public:
 
   void SetCov(const COV& cov){ P_ = cov; }
 
+  void setDegeneracyOptions(const DegeneracyOptions& opts) { degen_opts_ = opts; }
+  bool isDegenerate() const { return degen_detected_; }
+  int  consecutiveDegenFrames() const { return consecutive_degen_frames_; }
+  bool shouldResetMap() const { return reset_map_requested_; }
+  void clearResetMapFlag() { reset_map_requested_ = false; }
+
+  void setCalibEnabled(bool en) { calib_enabled_ = en; }
+  bool isCalibEnabled() const { return calib_enabled_; }
+  void setCalibS0(double s0) { calib_s0_ = s0; }
+  BASIC::SE3 getExtrinsic1() const { return T_L1_IMU_; }
+  BASIC::SE3 getExtrinsic2() const { return T_L2_IMU_; }
+  double getDeltaT1() const { return delta_t1_; }
+  double getDeltaT2() const { return delta_t2_; }
+
   BASIC::V3 GetGravity() const { return g_; }
 
   bool init_ = false;
@@ -88,6 +125,7 @@ public:
 private:
   void BuildNoise(const Options& options);
   void Update();
+  void RemapDegeneracy(const BASIC::M3& Q_trans, const BASIC::M6& HTVH, STATE& dx);
   
   bool  need_converge_  = true;
   float imu_scale_ = 1.0;
@@ -107,6 +145,12 @@ private:
   BASIC::V3 global_acc_  = BASIC::V3::Zero();
   BASIC::V3 body_omega_  = BASIC::V3::Zero();
 
+  // calibration state (nominal)
+  BASIC::SE3 T_L1_IMU_;       // LiDAR1→IMU extrinsic
+  BASIC::SE3 T_L2_IMU_;       // LiDAR2→IMU extrinsic
+  double delta_t1_ = 0.0;     // LiDAR1 time offset
+  double delta_t2_ = 0.0;     // LiDAR2 time offset
+
   STATE dx_ = STATE::Zero();
 
   COV P_ = COV::Identity();
@@ -114,6 +158,18 @@ private:
   NOISE Q_ = NOISE::Zero();
 
   Options options_;
+
+  DegeneracyOptions degen_opts_;
+  bool degen_detected_ = false;
+  bool calib_enabled_ = true;  // toggle for online calibration
+  double calib_s0_ = 1.0;      // Jacobian normalisation factor
+
+  // degeneracy recovery state machine
+  bool was_degenerate_ = false;
+  int  recovery_confirm_count_ = 0;
+  int  recovery_remaining_ = 0;
+  int  consecutive_degen_frames_ = 0;
+  bool reset_map_requested_ = false;
 
   double  forward_time_ = -1;
   IMUData forward_last_imu_;

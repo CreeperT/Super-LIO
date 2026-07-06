@@ -26,6 +26,8 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <chrono>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 
 /// msgs
 #include "super_lio/msg/cloud_pose.hpp"
@@ -59,6 +61,7 @@ public:
 
   void clear(){
     lidar_buffer_.clear();
+    lidar_buffer_2_.clear();
     imu_buffer_.clear();
     lidar_pushed_ = false;
     last_timestamp_imu_ = -1.0;
@@ -79,6 +82,8 @@ public:
   void set_global_map(const BASIC::CloudPtr& global_map);
 
   void pub_init_obs(const BASIC::CloudPtr& obs, const Eigen::Matrix4f& pose);
+  void pub_plane_features(const BASIC::CloudPtr& pc);
+  void pub_edge_features(const BASIC::CloudPtr& pc);
 
   void set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_guess, bool flg_finish_init = false);
 
@@ -86,10 +91,40 @@ public:
     return cb_sensor_;
   }
 
+  /// Spin cb_sensor_ once, safe to call even while rclcpp::spin() is active.
+  /// Temporarily releases the callback group from the main executor, processes
+  /// one batch of pending callbacks, then restores the association.
+  void spinSensorOnce(){
+    if (!cb_sensor_) return;
+
+    // If cb_sensor_ is already owned by another executor (e.g. rclcpp::spin),
+    // temporarily release it so we can spin it locally. This is safe because
+    // we are called from within that executor's callback → the main executor
+    // is blocked waiting for us to return.
+    auto& associated = cb_sensor_->get_associated_with_executor_atomic();
+    const bool was_associated = associated.exchange(false);
+
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_callback_group(cb_sensor_, this->get_node_base_interface(), false);
+    executor.spin_once(std::chrono::nanoseconds(0));
+    executor.remove_callback_group(cb_sensor_, false);
+
+    // Restore the flag so the owning executor can continue using cb_sensor_.
+    if (was_associated) {
+      associated.store(true);
+    }
+  }
+
 private:
   void imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg);
   void livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg);
   void stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void livoxHandler2(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg);
+  void stdMsgHandler2(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  bool validPoint2(double x, double y, double z);
+  double getDynamicLidar2Offset() const { return lidar2_dynamic_offset_; }
+  void updateLidar1Clock(double hdr_stamp);
+  void updateLidar2Clock(double hdr_stamp);
 
   void setupParams();
   void setupIO();
@@ -99,9 +134,20 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_lidar_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_std_;
+  rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_lidar2_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar2_std_;
 
   std::deque<IMUData>   imu_buffer_;
   std::deque<LidarData> lidar_buffer_;
+  std::deque<LidarData> lidar_buffer_2_;
+
+  // dynamic time offset estimation (lidar2 relative to lidar1)
+  double lidar1_clock_ = 0.0;           // lidar1: hdr_stamp - sys_time
+  double lidar2_clock_ = 0.0;           // lidar2: hdr_stamp - sys_time
+  bool   lidar1_clock_valid_ = false;
+  bool   lidar2_clock_valid_ = false;
+  double lidar2_dynamic_offset_ = 0.0;  // filtered offset
+
   bool lidar_pushed_ = false;
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;

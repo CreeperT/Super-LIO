@@ -26,7 +26,7 @@ def generate_launch_description():
         output='screen',
         parameters=[
             config_yaml,
-            {'use_sim_time': True}
+            {'use_sim_time': False}
         ],
         arguments=['--ros-args', '--log-level', 'info']
     )
@@ -36,7 +36,7 @@ def generate_launch_description():
         executable='rviz2',
         name='super_lio',
         parameters=[
-            {'use_sim_time': True} 
+            {'use_sim_time': False} 
         ],
         arguments=['-d', rviz_config_file, '--ros-args', '--log-level', 'warn'],
         condition=IfCondition(rviz_flag)
@@ -47,7 +47,7 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='static_tf_pub',
         parameters=[
-            {'use_sim_time': True}
+            {'use_sim_time': False}
         ],
         arguments=['0', '0', '0', '0', '0', '0', 'imu', 'base_link']
     )
@@ -58,7 +58,7 @@ def generate_launch_description():
         name='initial_pose_3d_marker',
         output='screen',
         parameters=[
-            {'use_sim_time': True},
+            {'use_sim_time': False},
             {'init_x': 0.0},
             {'init_y': 0.0},
             {'init_z': 0.2},

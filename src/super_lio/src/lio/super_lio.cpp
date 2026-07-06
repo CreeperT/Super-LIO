@@ -54,7 +54,7 @@ inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::
 
 
 inline bool compute_error(
-  const std::array<double, 4>& abcd, const V3& point, 
+  const std::array<double, 4>& abcd, const V3& point,
   const float length, scalar& error)
 {
   error = abcd[0] * point[0] + abcd[1] * point[1] + abcd[2] * point[2] + abcd[3];
@@ -62,12 +62,71 @@ inline bool compute_error(
 }
 
 
+/// Fit a line from 4-5 neighbor points using PCA.
+/// Checks linearity (λ_max / λ_2nd > linearity_ratio) and distance of all points to line.
+/// Returns line direction (unit vector) and centroid.
+inline bool fit_line_from_points(
+    const int N, const std::array<V3, 5>& points,
+    V3& direction, V3& centroid)
+{
+  // compute centroid
+  centroid = V3::Zero();
+  for (int i = 0; i < N; i++) {
+    centroid += points[i];
+  }
+  centroid /= static_cast<scalar>(N);
+
+  // build covariance matrix
+  M3 cov = M3::Zero();
+  for (int i = 0; i < N; i++) {
+    V3 d = points[i] - centroid;
+    cov += d * d.transpose();
+  }
+
+  // PCA: eigenvalues in increasing order (λ0 ≤ λ1 ≤ λ2)
+  Eigen::SelfAdjointEigenSolver<M3> eig(cov);
+  V3 ev = eig.eigenvalues();
+
+  // check linearity: λ2 (largest) >> λ1 (second largest)
+  if (ev(1) < 1e-10f || ev(2) / ev(1) < g_edge_linearity_ratio) {
+    return false;
+  }
+
+  // line direction = eigenvector of largest eigenvalue
+  direction = eig.eigenvectors().col(2);
+
+  // check all neighbors are close to the fitted line
+  for (int i = 0; i < N; i++) {
+    V3 diff = points[i] - centroid;
+    scalar dist = (diff - direction * direction.dot(diff)).norm();
+    if (dist > g_edge_line_dist_thresh) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
 void SuperLIO::init(){
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
   kf_.reset(new ESKF());
+
+  // set degeneracy options
+  {
+    ESKF::DegeneracyOptions degen_opts;
+    degen_opts.enabled = g_degeneracy_enabled;
+    degen_opts.max_trans_stddev = g_degeneracy_max_stddev;
+    degen_opts.htvh_cond_thresh = g_degeneracy_htvh_cond_thresh;
+    kf_->setDegeneracyOptions(degen_opts);
+  }
+
+  kf_->setCalibEnabled(g_enable_online_calib);
+
   data_wrapper_->setESKF(kf_);
   
   scan_undistort_full_.reset(new PointCloudType());
+  scan_undistort_full_2_.reset(new PointCloudType());
   ds_undistort_.reset(new PointCloudType());
   world_pc_.reset(new PointCloudType());
   ds_world_.reset(new PointCloudType());
@@ -77,8 +136,6 @@ void SuperLIO::init(){
   }
   
   points_world_v3_.reserve(21000);
-  abcd_vec_.resize(20000);
-  effect_knn_idxs_.resize(20000);
   voxel_grid_fliter_.setLeafSize(g_voxel_fliter_size);
 
   state_fn_ = &SuperLIO::stateWaitKFInit;
@@ -98,7 +155,7 @@ void SuperLIO::stateWaitKFInit()
 void SuperLIO::stateWaitMapInit()
 {
   if (map_init()) {
-    kf_->init_ = true;
+    // kf_->init_ = true;
     state_fn_ = &SuperLIO::stateProcess;
     LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init done" << RESET;
   }
@@ -149,10 +206,19 @@ bool SuperLIO::kf_init(){
   options.quit_eps_ = g_kf_quit_eps;
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
-  kf_->SetInitialConditions(options, mean_gyro, V3::Zero(), imu_scale, ref_gravity);
+
+  // Estimate accelerometer bias from stationary init data.
+  // At rest: measured = -gravity_imu + bias.  mean_acce ≈ -gravity_imu + bias.
+  // Expected static acc = mean_acce.normalized() * g ≈ -gravity_imu (unbiased).
+  // Therefore bias ≈ mean_acce - expected = mean_acce * (1 - g/|mean|).
+  V3 estimated_ba = mean_acce * (1.0f - imu_scale);
+
+  kf_->SetInitialConditions(options, mean_gyro, estimated_ba, imu_scale, ref_gravity);
   auto state = kf_->GetSysState();
   state.R = SO3(rot);
   state.p = g_odom_robo.t_;        // By default, the robot frame is used as the reference origin.
+  state.bg = mean_gyro;
+  state.ba = estimated_ba;
   state.timestamp = measures_.imu.back().secs;
   kf_->SetX(state);
   sys_init_pose_ = kf_->GetSE3();
@@ -206,6 +272,17 @@ void SuperLIO::stateProcess(){
   }
   Output();
   caceData();
+
+  // ── Map reset on persistent degeneracy ──
+  if (kf_->shouldResetMap()) {
+    LOG(WARNING) << YELLOW << " ---> [LIO] Resetting map (degeneracy)."
+                 << RESET;
+    ivox_->clear();
+    kf_->clearResetMapFlag();
+    skip_observe_frames_ = 5;
+  }
+
+  kf_->init_ = true;
 }
 
 
@@ -367,60 +444,149 @@ void SuperLIO::Propagation_Undistort(){
     propagate_states_.emplace_back(kf_->GetDynamicState());
   }
 
-  static const M3 TLI_R = g_lidar_imu.R_;
-  static const V3 TLI_t = g_lidar_imu.t_;
   const SE3 T_end = kf_->GetSE3();
   const M3  R_inv = T_end.R_.transpose();
   const V3  T_end_t = T_end.t_;
-  const double start_time = measures_.lidar.start_time;
-  auto& raw_pc = measures_.lidar.pc;
 
-  std::size_t ptsize = raw_pc->points.size();
-  scan_undistort_full_->resize(ptsize); 
+  // ── LiDAR 1 deskew ──────────────────────────────────────────
+  {
+    // Phase 1: use current calib estimate (not fixed nominal) for self-consistency
+    const SE3 T_ext1 = kf_->getExtrinsic1();
+    const M3 TLI_R = T_ext1.R_;
+    const V3 TLI_t = T_ext1.t_;
+    const double start_time = measures_.lidar.start_time;
+    auto& raw_pc = measures_.lidar.pc;
 
-  tbb::parallel_for(
-  tbb::blocked_range<size_t>(0, ptsize),
-  [&](const tbb::blocked_range<size_t>& r) {
-    M3 R_h, R_t; V3 p_h, v_h, acc_t, w_t;
-    for (size_t idx = r.begin(); idx < r.end(); ++idx) {  
-      auto& pt_full = scan_undistort_full_->points[idx];
-      const auto& pt = raw_pc->points[idx];
-      pt_full.intensity = pt.intensity;
-      double query_time = start_time + pt.offset_time;
-      if (query_time > propagate_states_.back().time) {
+    std::size_t ptsize = raw_pc->points.size();
+    scan_undistort_full_->resize(ptsize);
+
+    tbb::parallel_for(
+    tbb::blocked_range<size_t>(0, ptsize),
+    [&](const tbb::blocked_range<size_t>& r) {
+      M3 R_h, R_t; V3 p_h, v_h, acc_t, w_t;
+      for (size_t idx = r.begin(); idx < r.end(); ++idx) {
+        auto& pt_full = scan_undistort_full_->points[idx];
+        const auto& pt = raw_pc->points[idx];
+        pt_full.intensity = pt.intensity;
+        double query_time = start_time + pt.offset_time;
+        if (query_time > propagate_states_.back().time) {
+          V3 raw(pt.x, pt.y, pt.z);
+          V3 eigen_point = TLI_R * raw + TLI_t;
+          pt_full.x = eigen_point[0];
+          pt_full.y = eigen_point[1];
+          pt_full.z = eigen_point[2];
+          continue;
+        }
+        auto match_iter = propagate_states_.begin();
+        for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
+          auto next_iter = std::next(iter);
+          if (iter->time < query_time && next_iter->time >= query_time) {
+            match_iter = iter;
+            break;
+          }
+        }
+        auto match_iter_n = std::next(match_iter);
+        double dt = match_iter_n->time - match_iter->time;
+        double s = (query_time - match_iter->time) / dt;
+        R_h = match_iter->R;
+        R_t = match_iter_n->R;
+        p_h = match_iter->p;
+        v_h = match_iter->v;
+        acc_t = match_iter_n->a;
+        w_t = match_iter_n->w;
+        M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
+        V3 t_ei(p_h + v_h * dt + 0.5 * acc_t * dt * dt - T_end_t);
         V3 raw(pt.x, pt.y, pt.z);
-        V3 eigen_point = TLI_R * raw + TLI_t;
+        V3 eigen_point = R_inv * (R_i * (TLI_R * raw + TLI_t) + t_ei);
         pt_full.x = eigen_point[0];
         pt_full.y = eigen_point[1];
         pt_full.z = eigen_point[2];
-        continue;
       }
-      auto match_iter = propagate_states_.begin();
-      for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
-        auto next_iter = std::next(iter);
-        if (iter->time < query_time && next_iter->time >= query_time) {
-          match_iter = iter;
-          break;
+    });
+  }
+
+  // ── LiDAR 2 deskew (dual-LiDAR) ─────────────────────────────
+  if (measures_.has_lidar2 && measures_.lidar2.pc && !measures_.lidar2.pc->empty()) {
+    const SE3 T_ext2 = kf_->getExtrinsic2();
+    const M3 TLI2_R = T_ext2.R_;
+    const V3 TLI2_t = T_ext2.t_;
+    const double start_time2 = measures_.lidar2.start_time;
+    auto& raw_pc2 = measures_.lidar2.pc;
+
+    std::size_t ptsize2 = raw_pc2->points.size();
+    scan_undistort_full_2_->resize(ptsize2);
+
+    tbb::parallel_for(
+    tbb::blocked_range<size_t>(0, ptsize2),
+    [&](const tbb::blocked_range<size_t>& r) {
+      M3 R_h, R_t; V3 p_h, v_h, acc_t, w_t;
+      for (size_t idx = r.begin(); idx < r.end(); ++idx) {
+        auto& pt_full = scan_undistort_full_2_->points[idx];
+        const auto& pt = raw_pc2->points[idx];
+        // intensity normalization (Mid-360 reflectivity mapped to same scale)
+        pt_full.intensity = pt.intensity;
+        double query_time = start_time2 + pt.offset_time;
+        if (query_time > propagate_states_.back().time) {
+          V3 raw(pt.x, pt.y, pt.z);
+          V3 eigen_point = TLI2_R * raw + TLI2_t;
+          pt_full.x = eigen_point[0];
+          pt_full.y = eigen_point[1];
+          pt_full.z = eigen_point[2];
+          continue;
         }
+        auto match_iter = propagate_states_.begin();
+        for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
+          auto next_iter = std::next(iter);
+          if (iter->time < query_time && next_iter->time >= query_time) {
+            match_iter = iter;
+            break;
+          }
+        }
+        auto match_iter_n = std::next(match_iter);
+        double dt = match_iter_n->time - match_iter->time;
+        double s = (query_time - match_iter->time) / dt;
+        R_h = match_iter->R;
+        R_t = match_iter_n->R;
+        p_h = match_iter->p;
+        v_h = match_iter->v;
+        acc_t = match_iter_n->a;
+        w_t = match_iter_n->w;
+        M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
+        V3 t_ei(p_h + v_h * dt + 0.5 * acc_t * dt * dt - T_end_t);
+        V3 raw(pt.x, pt.y, pt.z);
+        V3 eigen_point = R_inv * (R_i * (TLI2_R * raw + TLI2_t) + t_ei);
+        pt_full.x = eigen_point[0];
+        pt_full.y = eigen_point[1];
+        pt_full.z = eigen_point[2];
       }
-      auto match_iter_n = std::next(match_iter);
-      double dt = match_iter_n->time - match_iter->time;
-      double s = (query_time - match_iter->time) / dt;
-      R_h = match_iter->R;
-      R_t = match_iter_n->R;
-      p_h = match_iter->p;
-      v_h = match_iter->v;
-      acc_t = match_iter_n->a;
-      w_t = match_iter_n->w;
-      M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
-      V3 t_ei(p_h + v_h * dt + 0.5 * acc_t * dt * dt - T_end_t);
-      V3 raw(pt.x, pt.y, pt.z);
-      V3 eigen_point = R_inv * (R_i * (TLI_R * raw + TLI_t) + t_ei);
-      pt_full.x = eigen_point[0];
-      pt_full.y = eigen_point[1];
-      pt_full.z = eigen_point[2];
+    });
+
+    // merge lidar2 into lidar1 cloud, mark lidar2 pts with negative intensity
+    static bool merge_logged = false;
+    if (!merge_logged) {
+      LOG(INFO) << GREEN << " ---> [Dual-LiDAR] Merged lidar2 ("
+                << scan_undistort_full_2_->size() << " pts) into lidar1 ("
+                << scan_undistort_full_->size() << " pts before merge)"
+                << " weight=" << g_lidar2_weight << RESET;
+      merge_logged = true;
     }
-  });
+    size_t lidar1_sz = scan_undistort_full_->size();
+    *scan_undistort_full_ += *scan_undistort_full_2_;
+    for (size_t i = lidar1_sz; i < scan_undistort_full_->size(); ++i) {
+      scan_undistort_full_->points[i].intensity =
+          -std::abs(scan_undistort_full_->points[i].intensity);
+    }
+  } else {
+    static bool nolidar2_logged = false;
+    if (g_dual_lidar_enable && !nolidar2_logged) {
+      LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] lidar2 NOT available: has_lidar2="
+                   << measures_.has_lidar2
+                   << " pc=" << (measures_.lidar2.pc ? "ok" : "null")
+                   << " empty=" << (measures_.lidar2.pc ? measures_.lidar2.pc->empty() : true)
+                   << RESET;
+      nolidar2_logged = true;
+    }
+  }
 }
 
 
@@ -433,33 +599,97 @@ void SuperLIO::DownSample(){
 struct ThreadACC{
   M6d HTVH = M6d::Zero();
   V6d HTVr = V6d::Zero();
-  ThreadACC(): HTVH(M6d::Zero()), HTVr(V6d::Zero()) {}
+  // Phase 1: calibration accumulation (21D obs: pose 6 + ext1 6 + ext2 6 + dt 3)
+  Eigen::Matrix<double, 21, 21> HTVH_calib = decltype(HTVH_calib)::Zero();
+  Eigen::Matrix<double, 21, 1>  HTVr_calib = decltype(HTVr_calib)::Zero();
+  std::vector<V3> plane_pts;
+  std::vector<V3> edge_pts;
 };
 
 
 void SuperLIO::Observe(){
   size_t ptsize = ds_undistort_->size();
-  
+
   static std::vector<float> _lengths;
+  static std::vector<float> _weights;
+  static std::vector<bool>  _is_lidar2;
   points_body_v3_.resize(ptsize);
   _lengths.resize(ptsize);
+  _weights.resize(ptsize);
+  _is_lidar2.resize(ptsize);
+
+  // Fix A: dynamic resize — no more 20000-element limit
+  abcd_vec_.resize(ptsize);
+  line_dir_vec_.resize(ptsize);
+  line_center_vec_.resize(ptsize);
+  effect_knn_idxs_.resize(ptsize);
+  effect_mask_.resize(ptsize);
+  effect_knn_mask_.resize(ptsize);
+  edge_mask_.resize(ptsize);
 
   effect_knn_num_ = ptsize;
-  std::iota(effect_knn_idxs_.begin(), effect_knn_idxs_.begin() + ptsize, 0);
+  std::iota(effect_knn_idxs_.begin(), effect_knn_idxs_.end(), 0);
 
   for(size_t i = 0; i < ptsize; ++i){
     const auto& point_body_pcl = ds_undistort_->points[i];
     points_body_v3_[i] = V3(point_body_pcl.x, point_body_pcl.y, point_body_pcl.z);
     _lengths[i] = points_body_v3_[i].norm();
+    // per-point weight: lidar2 points have negative intensity tag
+    _is_lidar2[i] = (point_body_pcl.intensity < 0);
+    _weights[i] = _is_lidar2[i] ? static_cast<float>(g_lidar2_weight) : 1.0f;
+
+    // Intensity-based weighting: retroreflective poles produce much stronger
+    // returns → more reliable features → higher weight.
+    float abs_intensity = std::abs(point_body_pcl.intensity);
+    if (abs_intensity > g_intensity_thresh) {
+      // Linear ramp from 1.0 at threshold to 1.0+g_intensity_weight at 255
+      float extra = g_intensity_weight * (abs_intensity - g_intensity_thresh)
+                    / (255.0f - g_intensity_thresh);
+      _weights[i] *= (1.0f + extra);
+    }
   }
+
+  // After map reset: skip IEKF to let map repopulate (empty map → no KNN)
+  if (skip_observe_frames_ > 0) {
+    skip_observe_frames_--;
+    return;
+  }
+
+  // Phase 1: global feature length for Jacobian normalisation.
+  double s0 = 1.0;
+  {
+    std::vector<float> ranges;
+    ranges.reserve(ptsize);
+    for (size_t i = 0; i < ptsize; ++i)
+      ranges.push_back(points_body_v3_[i].norm());
+    if (!ranges.empty()) {
+      std::sort(ranges.begin(), ranges.end());
+      s0 = std::max(1.0, static_cast<double>(ranges[ranges.size() / 2]));
+    }
+  }
+
+  kf_->setCalibS0(s0);
 
   ivox_->reset_max_group();
   int iter_num = 0;
 
-  kf_->UpdateObserve([&, this](const ESKF::KFState &kf_state, M6 &HTVH, V6 &HTVr) {
+  kf_->UpdateObserve([&, this, s0](const ESKF::KFState &kf_state,
+                                     M6 &HTVH_pose, V6 &HTVr_pose,
+                                     ESKF::OBS_MAT &HTVH_calib, ESKF::OBS_VEC &HTVr_calib) {
     const SE3 pose = kf_state.pose;
     const bool need_converge = kf_state.need_converge;
     const M3d R_transpose = (pose.R_.transpose()).cast<double>();
+    const bool do_calib = kf_->isCalibEnabled();
+    const double inv_s0 = 1.0 / s0;  // normalisation factor
+
+    // Phase 1: use CURRENT calib estimate for Jacobian.
+    // Deskewing now also uses kf_->getExtrinsic1/2() → self-consistent.
+    const SE3 T_ext1_est = kf_state.T_L1_IMU;
+    const SE3 T_ext2_est = kf_state.T_L2_IMU;
+    M3d R_ext1_T = T_ext1_est.R_.transpose().cast<double>();
+    M3d R_ext2_T = T_ext2_est.R_.transpose().cast<double>();
+    V3d t_ext1 = T_ext1_est.t_.cast<double>();
+    V3d t_ext2 = T_ext2_est.t_.cast<double>();
 
     tbb::enumerable_thread_specific<ThreadACC> tls_acc;
 
@@ -479,41 +709,196 @@ void SuperLIO::Observe(){
             if(top_K.count < 4){
               effect_mask_[idx] = false;
               effect_knn_mask_[idx] = false;
+              edge_mask_[idx] = false;
               continue;
             }
             effect_knn_mask_[idx] = true;
-            effect_mask_[idx] = calc_plane_coeff(top_K.count, top_K.points_, abcd_vec_[idx]);
+
+            // Feature extraction: retroreflective poles (high intensity) are
+            // cylindrical → line features. Try line first for them, plane first
+            // for normal points. This gives longitudinal constraints in corridors.
+            bool is_high_intensity =
+                (std::abs(ds_undistort_->points[idx].intensity) > g_intensity_thresh);
+
+            if (is_high_intensity && g_enable_edge_feature) {
+              // High-intensity: try line first (cylinder axis)
+              edge_mask_[idx] = fit_line_from_points(top_K.count, top_K.points_,
+                                                     line_dir_vec_[idx], line_center_vec_[idx]);
+              if (edge_mask_[idx]) {
+                V3& dir = line_dir_vec_[idx];
+                V3& center = line_center_vec_[idx];
+                V3 scan_diff = point_world - center;
+                scalar scan_dist = (scan_diff - dir * dir.dot(scan_diff)).norm();
+                if (scan_dist > g_edge_line_dist_thresh)
+                  edge_mask_[idx] = false;
+              }
+              if (!edge_mask_[idx]) {
+                // Line failed → fall back to plane
+                effect_mask_[idx] = calc_plane_coeff(top_K.count, top_K.points_, abcd_vec_[idx]);
+              } else {
+                effect_mask_[idx] = false;
+              }
+            } else {
+              // Normal point: try plane first
+              effect_mask_[idx] = calc_plane_coeff(top_K.count, top_K.points_, abcd_vec_[idx]);
+              if (!effect_mask_[idx] && g_enable_edge_feature) {
+                edge_mask_[idx] = fit_line_from_points(top_K.count, top_K.points_,
+                                                       line_dir_vec_[idx], line_center_vec_[idx]);
+                if (edge_mask_[idx]) {
+                  V3& dir = line_dir_vec_[idx];
+                  V3& center = line_center_vec_[idx];
+                  V3 scan_diff = point_world - center;
+                  scalar scan_dist = (scan_diff - dir * dir.dot(scan_diff)).norm();
+                  if (scan_dist > g_edge_line_dist_thresh)
+                    edge_mask_[idx] = false;
+                }
+              } else {
+                edge_mask_[idx] = false;
+              }
+            }
           }
 
-          if(!effect_mask_[idx]) continue;
+          if(!effect_mask_[idx] && !edge_mask_[idx]) continue;
 
-          auto& abcd = abcd_vec_[idx];
-          scalar error;
-          effect_mask_[idx] = compute_error(abcd, point_world, _lengths[idx], error);
-          if(!effect_mask_[idx]) continue;
-          
-          {
-            V3d normvec(abcd[0], abcd[1], abcd[2]);
-            V3d nb = R_transpose * normvec;
-            V3d point_body_d = point_body.cast<double>();
-            V6d J;
-            J.head<3>() = point_body_d.cross(nb);
-            J.tail<3>() = normvec;
-      
-            local_acc.HTVH += J * 1000 * J.transpose();
-            local_acc.HTVr -= J * 1000 * error;
+          // --- point-to-plane residual ---
+          if(effect_mask_[idx]){
+            auto& abcd = abcd_vec_[idx];
+            scalar error;
+            effect_mask_[idx] = compute_error(abcd, point_world, _lengths[idx], error);
+            if(effect_mask_[idx]){
+              V3d normvec(abcd[0], abcd[1], abcd[2]);
+              V3d nb = R_transpose * normvec;
+              V3d point_body_d = point_body.cast<double>();
+              V6d J_pose;
+              J_pose.head<3>() = point_body_d.cross(nb);
+              J_pose.tail<3>() = normvec;
+
+              double w = 1000.0 * _weights[idx];
+              local_acc.HTVH += J_pose * w * J_pose.transpose();
+              local_acc.HTVr -= J_pose * w * error;
+              local_acc.plane_pts.push_back(point_world);
+
+              // ── Phase 1: calibration Jacobian (point-to-plane) ──
+              if (do_calib) {
+                bool from_lidar2 = _is_lidar2[idx];
+                const M3d& R_ext_T = from_lidar2 ? R_ext2_T : R_ext1_T;
+                const V3d& t_ext = from_lidar2 ? t_ext2 : t_ext1;
+
+                // p_raw = T_nom^{-1} * p_body (LiDAR frame, using nominal extrinsic)
+                V3d p_raw = R_ext_T * (point_body_d - t_ext);
+                V3d nb_lidar = R_ext_T * nb;
+
+                // SE(3) right perturbation Jacobians (about nominal extrinsic)
+                V3d J_ext_rot  = p_raw.cross(nb_lidar) * inv_s0;  // ∂r/∂δθ = -(n×p)ᵀ = (p×n)ᵀ
+                V3d J_ext_trans = nb_lidar;
+
+                // 21D layout: pose(6), ext1(6), ext2(6), dt(3)
+                // Ext block: 6:12 for LiDAR1, 12:18 for LiDAR2
+                int ext_offset = from_lidar2 ? 12 : 6;
+
+                // Build 21D Jacobian
+                Eigen::Matrix<double, 21, 1> J_calib;
+                J_calib.setZero();
+                J_calib.segment<6>(0)  = J_pose.cast<double>();
+                J_calib.segment<3>(ext_offset)     = J_ext_rot;
+                J_calib.segment<3>(ext_offset + 3) = J_ext_trans;
+                // dt Jacobians: zero (not estimated yet)
+
+                local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
+                local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
+              }
+            }
+          }
+
+          // --- point-to-line (edge) residual ---
+          if(edge_mask_[idx]){
+            V3& line_dir = line_dir_vec_[idx];
+            V3& line_center = line_center_vec_[idx];
+
+            V3 diff = point_world - line_center;
+            scalar proj = line_dir.dot(diff);
+            V3 perp = diff - line_dir * proj;
+            scalar error = perp.norm();
+
+            if(error > 1e-6f){
+              V3 n_r = perp / error;
+
+              V3d n_r_d = n_r.cast<double>();
+              V3d nb = R_transpose * n_r_d;
+              V3d point_body_d = point_body.cast<double>();
+              V6d J_pose;
+              J_pose.head<3>() = point_body_d.cross(nb);
+              J_pose.tail<3>() = n_r_d;
+
+              double w = g_edge_weight * _weights[idx];
+              // Extra boost for retroreflective pole edge features
+              if (std::abs(ds_undistort_->points[idx].intensity) > g_intensity_thresh)
+                w *= g_high_intensity_edge_boost;
+              local_acc.HTVH += J_pose * w * J_pose.transpose();
+              local_acc.HTVr -= J_pose * w * error;
+              local_acc.edge_pts.push_back(point_world);
+
+              // ── Phase 1: calibration Jacobian (point-to-line) ──
+              if (do_calib) {
+                bool from_lidar2 = _is_lidar2[idx];
+                const M3d& R_ext_T = from_lidar2 ? R_ext2_T : R_ext1_T;
+                const V3d& t_ext = from_lidar2 ? t_ext2 : t_ext1;
+
+                V3d p_raw = R_ext_T * (point_body_d - t_ext);
+                V3d nb_lidar = R_ext_T * nb;
+
+                V3d J_ext_rot  = nb_lidar.cross(p_raw) * inv_s0;
+                V3d J_ext_trans = nb_lidar;
+
+                int ext_offset = from_lidar2 ? 12 : 6;
+                Eigen::Matrix<double, 21, 1> J_calib;
+                J_calib.setZero();
+                J_calib.segment<6>(0)  = J_pose.cast<double>();
+                J_calib.segment<3>(ext_offset)     = J_ext_rot;
+                J_calib.segment<3>(ext_offset + 3) = J_ext_trans;
+
+                local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
+                local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
+              }
+            } else {
+              edge_mask_[idx] = false;
+            }
           }
         }
     });
 
     M6d sum_HTVH = M6d::Zero();
     V6d sum_HTVr = V6d::Zero();
+    Eigen::Matrix<double, 21, 21> sum_HTVH_calib = decltype(sum_HTVH_calib)::Zero();
+    Eigen::Matrix<double, 21, 1>  sum_HTVr_calib = decltype(sum_HTVr_calib)::Zero();
+    static CloudPtr plane_feat(new PointCloudType());
+    static CloudPtr edge_feat(new PointCloudType());
+    plane_feat->clear();
+    edge_feat->clear();
     for(const auto& local_acc : tls_acc){
       sum_HTVH += local_acc.HTVH;
       sum_HTVr += local_acc.HTVr;
+      sum_HTVH_calib += local_acc.HTVH_calib;
+      sum_HTVr_calib += local_acc.HTVr_calib;
+      for (auto& p : local_acc.plane_pts) {
+        PointType pt; pt.x = p.x(); pt.y = p.y(); pt.z = p.z();
+        plane_feat->push_back(pt);
+      }
+      for (auto& p : local_acc.edge_pts) {
+        PointType pt; pt.x = p.x(); pt.y = p.y(); pt.z = p.z();
+        edge_feat->push_back(pt);
+      }
     }
-    HTVH = sum_HTVH.cast<scalar>();
-    HTVr = sum_HTVr.cast<scalar>();
+    HTVH_pose = sum_HTVH.cast<scalar>();
+    HTVr_pose = sum_HTVr.cast<scalar>();
+    HTVH_calib = sum_HTVH_calib.cast<scalar>();
+    HTVr_calib = sum_HTVr_calib.cast<scalar>();
+
+    // publish feature points for visualization
+    if (!plane_feat->empty())
+      data_wrapper_->pub_plane_features(plane_feat);
+    if (!edge_feat->empty())
+      data_wrapper_->pub_edge_features(edge_feat);
 
     if(need_converge) return;
 
@@ -578,6 +963,24 @@ void SuperLIO::Output(){
     }else{
       pcl::transformPointCloud(*ds_undistort_, *world_pc, transformation);
       data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+    }
+  }
+
+  // ── Phase 1: calibration status log ──
+  if (kf_->isCalibEnabled()) {
+    static int calib_log_count = 0;
+    int interval = (calib_log_count < 10) ? 1 : 200;
+    if (++calib_log_count % interval == 0) {
+      SE3 est1 = kf_->getExtrinsic1();
+      SE3 est2 = kf_->getExtrinsic2();
+      V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
+      V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
+      LOG(INFO) << CYAN << " ---> [Calib#" << calib_log_count
+                << "] ext1: t=[" << est1.t_.transpose()
+                << "] rpy=[" << rpy1.transpose() << "]°"
+                << " | ext2: t=[" << est2.t_.transpose()
+                << "] rpy=[" << rpy2.transpose() << "]°"
+                << RESET;
     }
   }
 }

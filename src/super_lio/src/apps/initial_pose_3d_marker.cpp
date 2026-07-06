@@ -37,27 +37,24 @@ public:
     pose_.position.z = this->get_parameter("init_z").as_double();
     pose_.orientation.w = 1.0;
 
-    // publisher
+    // TransientLocal: late subscribers (e.g. ros2 topic echo) receive last msg
     pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-        "/initialpose", rclcpp::QoS(10));
+        "/initialpose", rclcpp::QoS(10).transient_local());
 
-    // subscribe to /initialpose to follow pose set by other tools (e.g. 2D Pose Estimate)
     sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/initialpose", rclcpp::QoS(10),
         [this](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg) {
           if (msg->header.frame_id != "__marker_internal__") {
             pose_ = msg->pose.pose;
-            // force re-publish by erase + insert + applyChanges
             server_->erase("initial_pose_3d");
             createMarker();
+            publishPose();
             RCLCPP_INFO(this->get_logger(),
                 "Marker moved to external pose: (%.1f, %.1f, %.1f)",
                 pose_.position.x, pose_.position.y, pose_.position.z);
           }
         });
 
-    // interactive marker server
-    // namespace must start with "/" for absolute topic: /initial_pose_3d_marker/update
     server_ = std::make_unique<interactive_markers::InteractiveMarkerServer>(
         "/initial_pose_3d_marker", this);
 
@@ -65,8 +62,7 @@ public:
     publishPose();
 
     RCLCPP_INFO(this->get_logger(),
-        "3D Initial Pose Marker ready on /initial_pose_3d_marker/update. "
-        "In rviz: add 'InteractiveMarkers' display, set Update Topic to /initial_pose_3d_marker/update");
+        "3D Initial Pose Marker ready on /initial_pose_3d_marker/update");
   }
 
 private:

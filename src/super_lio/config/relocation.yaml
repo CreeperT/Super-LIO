@@ -18,16 +18,30 @@
     lio.sensor.voxel_fliter_size: 0.5
     lio.sensor.gravity_norm: 9.7946
     lio.sensor.imu_type: 1
-    lio.sensor.imu_na: 0.1
-    lio.sensor.imu_ng: 0.1
-    lio.sensor.imu_nba: 0.0001
-    lio.sensor.nbg: 0.0001
+    lio.sensor.imu_na: 0.05
+    lio.sensor.imu_ng: 0.01
+    lio.sensor.imu_nba: 0.01
+    lio.sensor.imu_nbg: 0.0005
 
     lio.extrinsic.lidar_imu: [-0.011, -0.02329, 0.04412, 
                               1.0, 0.0, 0.0, 
                               0.0, 1.0, 0.0, 
                               0.0, 0.0, 1.0]
     lio.extrinsic.odom_robo: [0.0, 0.0, 0.13, 0.0, 0.0, 0.0]
+
+    # second LiDAR (Mid-360, rear-facing, 30° tilted)
+    lio.lidar2.enable: false
+    lio.lidar2.lidar_type: 8
+    lio.lidar2.lidar_topic: "/livox/lidar"
+    lio.lidar2.blind: 0.3
+    lio.lidar2.maxrange: 100.0
+    lio.lidar2.filter_rate: 3
+    lio.lidar2.weight: 1.0
+    lio.lidar2.time_offset: 0.0
+    lio.lidar2.extrinsic_imu: [0.0, 0.0, 0.0,
+                               1.0, 0.0, 0.0,
+                               0.0, 1.0, 0.0,
+                               0.0, 0.0, 1.0]
 
     lio.hash_map.hash_capacity: 100000000
     lio.hash_map.vox_resolution: 0.5
@@ -67,5 +81,21 @@
     lio.relocation.coarse_ndt_resolution: 5.0
     lio.relocation.medium_ds_size: 0.8
     lio.relocation.medium_ndt_resolution: 2.0
+    # relocation robustness
+    lio.relocation.init_frames: 5
+    lio.relocation.z_search_range: 2.0
+    lio.relocation.z_search_step: 1.0
+    lio.relocation.min_overlap_ratio: 0.3
+
+    # point-to-line edge feature
+    lio.feature.enable_edge: true
+    lio.feature.edge_weight: 500.0
+    lio.feature.edge_line_dist_thresh: 0.08
+    lio.feature.edge_linearity_ratio: 5.0
+
+    # degeneracy handling
+    lio.degeneracy.enabled: true
+    lio.degeneracy.max_stddev: 0.5
+    lio.degeneracy.htvh_cond_thresh: 100.0
 
     lio.eva.timer: true

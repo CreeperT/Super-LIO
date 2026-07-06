@@ -73,16 +73,27 @@ void SuperLIOReLoc::init(){
   data_wrapper_->setESKF(kf_);
   
   scan_undistort_full_.reset(new PointCloudType());
+  scan_undistort_full_2_.reset(new PointCloudType());
   ds_undistort_.reset(new PointCloudType());
   world_pc_.reset(new PointCloudType());
   ds_world_.reset(new PointCloudType());
   point_map_.reset(new PointCloudType());
   init_obs_data_.reset(new PointCloudType());
+  init_obs_data2_.reset(new PointCloudType());
   
   points_world_v3_.reserve(21000);
-  abcd_vec_.resize(20000);
-  effect_knn_idxs_.resize(20000);
   voxel_grid_fliter_.setLeafSize(g_voxel_fliter_size);
+
+  // set degeneracy options
+  {
+    ESKF::DegeneracyOptions degen_opts;
+    degen_opts.enabled = g_degeneracy_enabled;
+    degen_opts.max_trans_stddev = g_degeneracy_max_stddev;
+    degen_opts.htvh_cond_thresh = g_degeneracy_htvh_cond_thresh;
+    kf_->setDegeneracyOptions(degen_opts);
+  }
+
+  kf_->setCalibEnabled(g_enable_online_calib);
 
   LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized." << RESET;
 
@@ -118,6 +129,17 @@ bool SuperLIOReLoc::map_init(){
 
   ivox_->insert(point_map_v3);
 
+  // compute map z-bounds for sanity checking during relocation
+  {
+    map_z_min_ = std::numeric_limits<float>::max();
+    map_z_max_ = std::numeric_limits<float>::lowest();
+    for (const auto& pt : *point_map_) {
+      if (pt.z < map_z_min_) map_z_min_ = pt.z;
+      if (pt.z > map_z_max_) map_z_max_ = pt.z;
+    }
+    LOG(INFO) << GREEN << " ---> Map Z bounds: [" << map_z_min_ << ", " << map_z_max_ << "]" << RESET;
+  }
+
   LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
   ivox_->printInfo();
@@ -131,8 +153,9 @@ bool SuperLIOReLoc::map_init(){
 
 
 bool SuperLIOReLoc::kf_init(){
-  const int need_init_frames = 10;
+  const int need_init_frames = g_reloc_init_frames;
   static int imu_cout = 0;
+  static int stationary_imu_cout = 0;
   static int init_frame_count = 0;
   static V3 mean_gyro = V3::Zero();
   static V3 mean_acce = V3::Zero();
@@ -140,15 +163,18 @@ bool SuperLIOReLoc::kf_init(){
   /// get init guess from ROS topic.
   if(flg_get_init_guess_){
     imu_cout = 0;
+    stationary_imu_cout = 0;
     init_frame_count = 0;
     init_obs_data_->clear();
+    init_obs_data2_->clear();
     mean_gyro = V3::Zero();
     mean_acce = V3::Zero();
     flg_get_init_guess_ = false;
     return false;
   }
 
-  CloudPtr point_cloud_pcl = CloudPtr(new PointCloudType());
+  // ── Fix 3: accumulate lidar1 and lidar2 points separately ──
+  CloudPtr lidar1_cloud = CloudPtr(new PointCloudType());
   for(std::size_t i = 0; i < measures_.lidar.pc->size(); i++){
     auto p = measures_.lidar.pc->points[i];
     PointType point;
@@ -156,18 +182,44 @@ bool SuperLIOReLoc::kf_init(){
     point.y = p.y;
     point.z = p.z;
     point.intensity = p.intensity;
-    point_cloud_pcl->points.push_back(point);
+    lidar1_cloud->points.push_back(point);
+  }
+
+  CloudPtr lidar2_cloud = CloudPtr(new PointCloudType());
+  if (measures_.has_lidar2 && measures_.lidar2.pc && !measures_.lidar2.pc->empty()) {
+    for(std::size_t i = 0; i < measures_.lidar2.pc->size(); i++){
+      auto p = measures_.lidar2.pc->points[i];
+      PointType point;
+      point.x = p.x;
+      point.y = p.y;
+      point.z = p.z;
+      point.intensity = p.intensity;
+      lidar2_cloud->points.push_back(point);
+    }
   }
 
   if(init_frame_count < need_init_frames){
-    *init_obs_data_ += *point_cloud_pcl;
+    *init_obs_data_ += *lidar1_cloud;
+    if (!lidar2_cloud->empty())
+      *init_obs_data2_ += *lidar2_cloud;
   }
   init_frame_count++;
 
+  // ── Fix 1: only use stationary IMU data for gravity estimation ──
+  // A measurement is "stationary" if accel magnitude ≈ gravity AND gyro is small.
+  // This prevents motion acceleration from corrupting the gravity direction estimate.
+  int total_imu = 0;
   for(auto& imu: measures_.imu){
-    imu_cout ++;
-    mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
-    mean_acce += (imu.acc - mean_acce) / imu_cout;
+    total_imu++;
+    double acc_norm = imu.acc.norm();
+    double gyr_norm = imu.gyr.norm();
+    bool is_stationary = (std::abs(acc_norm - g_gravity_norm) < 1.5) && (gyr_norm < 0.15);
+    if (is_stationary) {
+      imu_cout++;
+      mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
+      mean_acce += (imu.acc - mean_acce) / imu_cout;
+    }
+    stationary_imu_cout += (is_stationary ? 1 : 0);
   }
 
   if(imu_cout < 20){
@@ -178,7 +230,23 @@ bool SuperLIOReLoc::kf_init(){
     return false;
   }
 
-  LOG(INFO) << YELLOW << " ---> INIT start... obs_data size: " << init_obs_data_->size() << " target size: " << point_map_->size() << RESET;
+  // ── Fix 4: warn if robot was moving during accumulation ──
+  {
+    double ratio = (total_imu > 0) ? static_cast<double>(stationary_imu_cout) / total_imu : 0.0;
+    double mean_gyro_norm = mean_gyro.norm();
+    if (ratio < 0.5 || mean_gyro_norm > 0.1) {
+      LOG(WARNING) << YELLOW
+                   << " ---> [Reloc] Robot may have been moving during init! "
+                   << "stationary_imu=" << (ratio * 100) << "% "
+                   << "mean_gyro=" << mean_gyro_norm << " rad/s "
+                   << "| Gravity estimate may be unreliable — keep robot still!"
+                   << RESET;
+    }
+  }
+
+  LOG(INFO) << YELLOW << " ---> INIT start... obs_data size: " << init_obs_data_->size()
+            << " obs_data2 size: " << init_obs_data2_->size()
+            << " target size: " << point_map_->size() << RESET;
 
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
   V3 ref_gravity(0, 0, - g_gravity_norm);
@@ -196,14 +264,28 @@ bool SuperLIOReLoc::kf_init(){
   init_guess_T.block<3, 1>(0, 3) = init_guess_t_;
 
 
+  // ── Fix 3: transform each lidar with its own extrinsic, then merge in IMU frame ──
   pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_src(new pcl::PointCloud<pcl::PointXYZI>());
-  pcl::transformPointCloud(*init_obs_data_, *tmp_src, g_lidar_imu.matrix().cast<float>());
+  {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr tmp1(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::transformPointCloud(*init_obs_data_, *tmp1, g_lidar_imu.matrix().cast<float>());
+    *tmp_src = *tmp1;
 
-  // ---- Plan A: publish initial observation for rviz visualization ----
-  // LiDAR -> World = init_guess_T * g_lidar_imu (IMU pose × LiDAR-to-IMU extrinsic)
-  M4 lidar_to_world = init_guess_T * g_lidar_imu.matrix();
-  data_wrapper_->pub_init_obs(init_obs_data_, lidar_to_world.matrix().cast<float>());
-  LOG(INFO) << CYAN << " ---> Published init observation to /lio/init_obs for visual debugging." << RESET;
+    if (g_dual_lidar_enable && init_obs_data2_ && !init_obs_data2_->empty()) {
+      pcl::PointCloud<pcl::PointXYZI>::Ptr tmp2(new pcl::PointCloud<pcl::PointXYZI>());
+      pcl::transformPointCloud(*init_obs_data2_, *tmp2, g_lidar_imu2.matrix().cast<float>());
+      *tmp_src += *tmp2;
+      LOG(INFO) << CYAN << " ---> Merged lidar1(" << tmp1->size()
+                << ") + lidar2(" << tmp2->size() << ") in IMU frame." << RESET;
+    }
+  }
+
+  // ---- publish initial observation for rviz visualization ----
+  {
+    M4 lidar_to_world = init_guess_T;  // tmp_src is already in IMU frame, init_guess_T maps IMU→World
+    data_wrapper_->pub_init_obs(tmp_src, lidar_to_world.matrix().cast<float>());
+    LOG(INFO) << CYAN << " ---> Published init observation to /lio/init_obs (" << tmp_src->size() << " pts)." << RESET;
+  }
 
   // ---- helper: downsample point cloud ----
   auto downsample = [](const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, double leaf) {
@@ -219,13 +301,14 @@ bool SuperLIOReLoc::kf_init(){
     return out;
   };
 
-  // ---- helper: make initial guess with yaw offset ----
-  auto make_guess_T = [&](double yaw_offset_deg) -> M4 {
+  // ---- helper: make initial guess with yaw offset and optional z offset ----
+  auto make_guess_T = [&](double yaw_offset_deg, double z_offset = 0.0) -> M4 {
     M4 T = init_guess_T;
     if (std::abs(yaw_offset_deg) > 0.01) {
       M3 R_yaw = Eigen::AngleAxis<scalar>(yaw_offset_deg * M_PI / 180.0, V3::UnitZ()).toRotationMatrix();
       T.block<3, 3>(0, 0) = init_guess_R_ * R_yaw;
     }
+    T(2, 3) += z_offset;
     return T;
   };
 
@@ -273,9 +356,39 @@ bool SuperLIOReLoc::kf_init(){
   icp.setInputTarget(fine_target);
   icp.setInputSource(tmp_src);
 
-  // ---- registration cascade for a single yaw candidate ----
-  auto try_registration = [&](double yaw_offset_deg) -> std::pair<bool, M4> {
-    Eigen::Matrix4f guess = make_guess_T(yaw_offset_deg).matrix().cast<float>();
+  // ---- check ICP result quality (z-bounds + overlap ratio) ----
+  auto verify_result = [&](const Eigen::Matrix4f& T) -> bool {
+    // z-bounds sanity check: result must be within map z range (±2m margin)
+    float result_z = T(2, 3);
+    if (result_z < map_z_min_ - 2.0f || result_z > map_z_max_ + 2.0f) {
+      return false;
+    }
+    // overlap ratio check (if enabled)
+    if (g_reloc_min_overlap_ratio > 0.0) {
+      pcl::PointCloud<pcl::PointXYZI> aligned;
+      pcl::transformPointCloud(*tmp_src, aligned, T);
+      pcl::KdTreeFLANN<pcl::PointXYZI> kdtree;
+      kdtree.setInputCloud(fine_target);
+      int inliers = 0;
+      std::vector<int> idx(1);
+      std::vector<float> dist(1);
+      const float max_dist = static_cast<float>(g_reloc_icp_max_corr);
+      for (const auto& pt : aligned) {
+        if (kdtree.nearestKSearch(pt, 1, idx, dist) > 0 && dist[0] < max_dist) {
+          inliers++;
+        }
+      }
+      double overlap = static_cast<double>(inliers) / aligned.size();
+      if (overlap < g_reloc_min_overlap_ratio) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // ---- registration cascade for a single (yaw, z) candidate ----
+  auto try_registration = [&](double yaw_offset_deg, double z_offset = 0.0) -> std::pair<bool, M4> {
+    Eigen::Matrix4f guess = make_guess_T(yaw_offset_deg, z_offset).matrix().cast<float>();
 
     if (g_reloc_enable_multi_res) {
       // Stage 1: Coarse NDT (wide capture basin, fast)
@@ -283,7 +396,6 @@ bool SuperLIOReLoc::kf_init(){
                    static_cast<float>(g_reloc_coarse_ndt_resolution),
                    coarse_target, tmp_src))
       {
-        LOG(INFO) << CYAN << " ---> yaw=" << yaw_offset_deg << "° | COARSE NDT: FAILED" << RESET;
         return {false, M4::Identity()};
       }
       double coarse_score = coarse_ndt.getFitnessScore();
@@ -294,8 +406,6 @@ bool SuperLIOReLoc::kf_init(){
                    static_cast<float>(g_reloc_medium_ndt_resolution),
                    medium_target, tmp_src))
       {
-        LOG(INFO) << CYAN << " ---> yaw=" << yaw_offset_deg << "° | coarse=" << coarse_score
-                  << " | MEDIUM NDT: FAILED" << RESET;
         return {false, M4::Identity()};
       }
       double medium_score = medium_ndt.getFitnessScore();
@@ -307,33 +417,38 @@ bool SuperLIOReLoc::kf_init(){
       double icp_score = icp.getFitnessScore();
 
       LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
+                << " z_off=" << z_offset
                 << " | coarse=" << coarse_score
                 << " medium=" << medium_score
-                << " | ICP: ok=" << icp_ok << " score=" << icp_score << RESET;
+                << " | ICP: ok=" << icp_ok << " score=" << icp_score;
 
       if (icp_ok && icp_score < g_reloc_fitness_thresh) {
-        return {true, icp.getFinalTransformation().cast<scalar>()};
+        M4 result = icp.getFinalTransformation().cast<scalar>();
+        if (verify_result(icp.getFinalTransformation())) {
+          return {true, result};
+        }
       }
       return {false, M4::Identity()};
 
     } else {
-      // Single-resolution fallback (original behavior)
+      // Single-resolution fallback
       float fine_res = static_cast<float>(g_reloc_ndt_resolution);
       if (!run_ndt(fine_ndt, unused_result, guess, 25, fine_res, fine_target, tmp_src)) {
-        LOG(INFO) << CYAN << " ---> yaw=" << yaw_offset_deg << "° | NDT: FAILED" << RESET;
         return {false, M4::Identity()};
       }
-      double ndt_score = fine_ndt.getFitnessScore();
       icp.align(*unused_result, fine_ndt.getFinalTransformation());
       bool icp_ok = icp.hasConverged();
       double icp_score = icp.getFitnessScore();
 
-      LOG(INFO) << CYAN << " ---> yaw=" << yaw_offset_deg << "°"
-                << " | NDT score=" << ndt_score
-                << " | ICP: ok=" << icp_ok << " score=" << icp_score << RESET;
+      LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
+                << " z_off=" << z_offset
+                << " | NDT+ICP: ok=" << icp_ok << " score=" << icp_score;
 
       if (icp_ok && icp_score < g_reloc_fitness_thresh) {
-        return {true, icp.getFinalTransformation().cast<scalar>()};
+        M4 result = icp.getFinalTransformation().cast<scalar>();
+        if (verify_result(icp.getFinalTransformation())) {
+          return {true, result};
+        }
       }
       return {false, M4::Identity()};
     }
@@ -343,25 +458,39 @@ bool SuperLIOReLoc::kf_init(){
   auto [success, best_T] = try_registration(0.0);
   double best_icp_score = success ? icp.getFitnessScore() : std::numeric_limits<double>::max();
 
-  // ---- multi-yaw fallback ----
+  // ---- multi-yaw + z-offset fallback ----
   if (!success && g_reloc_multi_yaw_search) {
-    LOG(WARNING) << YELLOW << " ---> First attempt failed, trying multi-yaw search..." << RESET;
+    LOG(WARNING) << YELLOW << " ---> First attempt failed, trying multi-yaw + z-offset search..."
+                 << " z_range=±" << g_reloc_z_search_range
+                 << " z_step=" << g_reloc_z_search_step << RESET;
 
-    for (int i = 1; i <= g_reloc_yaw_search_count; ++i) {
-      for (double sign : {1.0, -1.0}) {
-        double yaw_off = sign * i * g_reloc_yaw_step_deg;
-        auto [ok, T] = try_registration(yaw_off);
-        if (ok) {
-          double score = icp.getFitnessScore();
-          LOG(INFO) << GREEN << " ---> Found candidate: yaw_offset=" << yaw_off
-                    << "° ICP score=" << score << RESET;
-          if (score < best_icp_score) {
-            best_icp_score = score;
-            best_T = T;
-            success = true;
+    // collect z offsets to try (0, ±step, ±2*step, ...)
+    std::vector<double> z_offsets = {0.0};
+    for (double z = g_reloc_z_search_step; z <= g_reloc_z_search_range + 1e-6;
+         z += g_reloc_z_search_step) {
+      z_offsets.push_back(z);
+      z_offsets.push_back(-z);
+    }
+
+    for (double z_off : z_offsets) {
+      for (int i = 1; i <= g_reloc_yaw_search_count; ++i) {
+        for (double sign : {1.0, -1.0}) {
+          double yaw_off = sign * i * g_reloc_yaw_step_deg;
+          auto [ok, T] = try_registration(yaw_off, z_off);
+          if (ok) {
+            double score = icp.getFitnessScore();
+            LOG(INFO) << GREEN << " ---> Found: yaw=" << yaw_off
+                      << "° z_off=" << z_off
+                      << " ICP score=" << score << RESET;
+            if (score < best_icp_score) {
+              best_icp_score = score;
+              best_T = T;
+              success = true;
+            }
           }
         }
       }
+      if (success) break;  // stop at first z level that works
     }
   }
 
@@ -391,14 +520,31 @@ bool SuperLIOReLoc::kf_init(){
   options.quit_eps_ = g_kf_quit_eps;
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
-  kf_->SetInitialConditions(options, mean_gyro, V3::Zero(), imu_scale, ref_gravity);
+
+  // Estimate accelerometer bias from stationary init data.
+  // At rest: measured = -gravity_imu + bias.  mean_acce ≈ -gravity_imu + bias.
+  // Expected static acc = mean_acce.normalized() * g ≈ -gravity_imu (unbiased).
+  // Therefore bias ≈ mean_acce - expected = mean_acce * (1 - g/|mean|).
+  V3 estimated_ba = mean_acce * (1.0f - imu_scale);
+
+  kf_->SetInitialConditions(options, mean_gyro, estimated_ba, imu_scale, ref_gravity);
   auto state = kf_->GetSysState();
   /// The horizontal initial state of the imu in the robot coordinate system.
   state.R = SO3(init_guess_T.block<3, 3>(0, 0));
   state.p = init_guess_T.block<3, 1>(0, 3);
+  state.bg = mean_gyro;
+  state.ba = estimated_ba;
   state.timestamp = measures_.imu.back().secs;
   kf_->SetX(state);
   sys_init_pose_ = kf_->GetSE3();
+
+  // {
+  //   point_map_->clear();
+  //   point_map_.reset(new PointCloudType());
+  //   init_obs_data_->clear();
+  //   init_obs_data_ = nullptr;
+  //   data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_, true);
+  // }
 
   {
     point_map_->clear();
@@ -406,7 +552,13 @@ bool SuperLIOReLoc::kf_init(){
     init_obs_data_->clear();
     init_obs_data_ = nullptr;
     data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_, true);
+    data_wrapper_->spinSensorOnce();
+    data_wrapper_->spinSensorOnce();
+    data_wrapper_->spinSensorOnce();
+    data_wrapper_->clear();        //// 清理掉 old 数据.
   }
+
+
 
   return true;
 }
@@ -443,14 +595,32 @@ void SuperLIOReLoc::UpdateMap() {
 
 void SuperLIOReLoc::Output() {
   auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);  
+  data_wrapper_->pub_odom(state);
+
+  // ── Phase 1: calibration status log (before early return) ──
+  if (kf_->isCalibEnabled()) {
+    static int calib_log_count = 0;
+    int interval = (calib_log_count < 10) ? 1 : 100;
+    if (++calib_log_count % interval == 0) {
+      SE3 est1 = kf_->getExtrinsic1();
+      SE3 est2 = kf_->getExtrinsic2();
+      V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
+      V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
+      LOG(INFO) << CYAN << " ---> [Calib#" << calib_log_count
+                << "] ext1: t=[" << est1.t_.transpose()
+                << "] rpy=[" << rpy1.transpose() << "]°"
+                << " | ext2: t=[" << est2.t_.transpose()
+                << "] rpy=[" << rpy2.transpose() << "]°"
+                << RESET;
+    }
+  }
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
   transformation.block<3, 1>(0, 3) = state.p.cast<float>();
 
   CloudPtr world_pc(new PointCloudType());
-  
+
   if(g_visual_map){
     static int count = -1;
     count++;

@@ -1,66 +1,131 @@
 /**:
   ros__parameters:
-    lio.map.save_map: false
-    lio.map.if_filter: false
-    lio.map.save_map_dir: "map"
-    lio.map.map_name: "GroutingHole-DrainageHole.pcd"
-    lio.map.ds_size: 0.3
-    lio.map.save_interval: 500
+    # ===================== Map ====================================
+    lio.map.save_map: false               # 是否保存地图PCD
+    lio.map.if_filter: false              # 保存时是否体素滤波
+    lio.map.save_map_dir: "map"           # 地图保存目录（相对于包根目录）
+    lio.map.map_name: "GroutingHole-DrainageHole.pcd"  # 地图文件名
+    # lio.map.map_name: "map.pcd"
+    lio.map.ds_size: 0.3                 # 地图保存时降采样分辨率(m)
+    lio.map.save_interval: 500           # 每N帧保存一次，<0=不保存
 
-    lio.ros.lidar_topic: "/points_raw_combined"
-    lio.ros.imu_topic: "/dog_imu_raw"
+    # ===================== ROS Topic ==============================
+    lio.ros.lidar_topic: "/rslidar_points"   # 雷达1点云话题
+    lio.ros.imu_topic: "/dog_imu_raw"        # IMU话题（时间基准）
 
-    lio.sensor.lidar_type: 2
-    lio.sensor.blind: 2.0
-    lio.sensor.maxrange: 150.0
-    lio.sensor.filter_rate: 3
-    lio.sensor.enable_downsample: true
-    lio.sensor.voxel_fliter_size: 0.5
-    lio.sensor.gravity_norm: 9.7946
-    lio.sensor.imu_type: 1
-    lio.sensor.imu_na: 0.1
-    lio.sensor.imu_ng: 0.1
-    lio.sensor.imu_nba: 0.0001
-    lio.sensor.imu_nbg: 0.0001
+    # ===================== LiDAR1 (速腾32线, 前向) ===============
+    lio.sensor.lidar_type: 2             # 雷达类型: 1=Livox 2=Hesai16 3=Velo16 4=Velo32 5=NCLT 6=LS16 7=Ouster 8=LivoxPC2
+    lio.sensor.blind: 1.0                # 盲区距离(m)，d<此值丢弃
+    lio.sensor.maxrange: 150.0           # 最大有效距离(m)，d>此值丢弃
+    lio.sensor.filter_rate: 3            # 降采样率：每隔N个点取1个
+    lio.sensor.intensity_thresh: 80.0   # 反光柱强度阈值，高于此值的点权重加倍
+    lio.sensor.intensity_weight: 2.5     # 高强度点的额外权重倍数
+    lio.sensor.enable_downsample: true   # 是否启用体素降采样
+    lio.sensor.voxel_fliter_size: 0.5    # 体素降采样分辨率(m)
+    lio.sensor.gravity_norm: 9.7946      # 当地重力加速度(m/s²)
+    lio.sensor.time_offset: 0.0          # 雷达1时钟修正(s)，header_stamp+=此值
+    lio.sensor.imu_type: 1               # IMU类型（保留）
+    # ---- IMU噪声参数（ESKF过程噪声协方差Q）----
+    lio.sensor.imu_na: 0.1               # 加速度计测量噪声(m/s²)
+    lio.sensor.imu_ng: 0.1               # 陀螺仪测量噪声(rad/s)
+    lio.sensor.imu_nba: 0.001            # 加速度计零偏随机游走(m/s²/√s)
+    lio.sensor.imu_nbg: 0.0005           # 陀螺仪零偏随机游走(rad/s/√s)
 
-    lio.extrinsic.lidar_imu: [0.0, 0.0, 0.0, 
-                              1.0, 0.0, 0.0, 
-                              0.0, 1.0, 0.0, 
+    # ---- 外参：雷达1 → IMU [tx,ty,tz, R00..R22] ----
+    # 速腾: x+0.34218, y=0, z+0.17851
+    lio.extrinsic.lidar_imu: [0.34218, 0.0, 0.17851,
+                              1.0, 0.0, 0.0,
+                              0.0, 1.0, 0.0,
                               0.0, 0.0, 1.0]
+    # ---- 外参：里程计→机器人 [x,y,z,roll,pitch,yaw(deg)] ----
     lio.extrinsic.odom_robo: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-    lio.hash_map.hash_capacity: 100000000
-    lio.hash_map.vox_resolution: 0.5
+    # ===================== LiDAR2 (Mid-360, 后向斜上30°) =========
+    lio.lidar2.enable: true              # 启用双雷达融合
+    lio.lidar2.lidar_type: 8             # 雷达2类型（同上枚举，8=LivoxPC2）
+    lio.lidar2.lidar_topic: "/livox/lidar"  # 雷达2点云话题
+    lio.lidar2.blind: 1.0                # 盲区距离(m)
+    lio.lidar2.maxrange: 100.0           # 最大有效距离(m)
+    lio.lidar2.filter_rate: 3            # 降采样率
+    lio.lidar2.weight: 1.0               # 观测权重（相对雷达1，1.0=等权）
+    lio.lidar2.time_offset: 36.15        # 初始时钟修正(s)，动态补偿启动后自动更新
+    # ---- 外参：雷达2 → IMU [tx,ty,tz, R00..R22] ----
+    # Mid-360: x-0.3, y=0, z+0.15, pitch+30° (Ry=[[c30,0,s30],[0,1,0],[-s30,0,c30]])
+    lio.lidar2.extrinsic_imu: [-0.3, 0.0, 0.15,
+                                0.866025, 0.0, 0.5,
+                                0.0, 1.0, 0.0,
+                               -0.5, 0.0, 0.866025]
 
-    lio.kf.kf_type: 0
-    lio.kf.kf_max_iterations: 4
-    lio.kf.kf_align_gravity: true
-    lio.kf.kf_quit_eps: 0.001
+    # 故意加误差的外参（用于测试在线标定恢复能力）
+    # lio.lidar2.extrinsic_imu: [-0.3, 0.02, 0.20,    # 平移加了 2cm y, 5cm z
+    #                             0.819152, 0.0, 0.573576,  # pitch 35° 而非 30°
+    #                             0.0, 1.0, 0.0,
+    #                           -0.573576, 0.0, 0.819152]
 
-    lio.output.robot: false
-    lio.output.plan_env_world: false
-    lio.output.plan_env_body: false
-    lio.output.planner: false
-    lio.output.map: true
-    lio.output.dense: true
-    lio.output.pub_step: 10
 
-    lio.eva.timer: true
+    # ===================== 地图（OctVoxMap）========================
+    lio.hash_map.hash_capacity: 100000000 # 体素容量上限（LRU淘汰）
+    lio.hash_map.vox_resolution: 0.5      # 体素分辨率(m)
 
-    # relocation registration tuning
-    lio.relocation.update_map: false
-    lio.relocation.init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    lio.relocation.target_ds_size: 0.5
-    lio.relocation.ndt_resolution: 1.0
-    lio.relocation.icp_max_corr: 8.0
-    lio.relocation.icp_max_iter: 40
-    lio.relocation.fitness_thresh: 1.5
-    lio.relocation.multi_yaw_search: true
-    lio.relocation.yaw_step_deg: 30.0
-    lio.relocation.yaw_search_count: 6
-    # multi-resolution NDT cascade (coarse-to-fine)
-    lio.relocation.enable_multi_res: true
-    lio.relocation.coarse_ds_size: 1.5
-    lio.relocation.coarse_ndt_resolution: 5.0
-    lio.relocation.medium_ds_size: 0.8
-    lio.relocation.medium_ndt_resolution: 2.0
+    # ===================== Kalman Filter =========================
+    lio.kf.kf_type: 0                    # KF类型: 0=ESKF
+    lio.kf.kf_max_iterations: 6          # IEKF最大迭代次数
+    lio.kf.kf_align_gravity: true        # 是否重力对齐初始化
+    lio.kf.kf_quit_eps: 0.0001            # 迭代收敛阈值（dx无穷范数）
+
+    # ===================== 输出 ==================================
+    lio.output.robot: false              # 发布机器人坐标系odom (/mavros/vision_pose)
+    lio.output.plan_env_world: false     # 发布世界系规划环境点云
+    lio.output.plan_env_body: false      # 发布体坐标系规划环境点云
+    lio.output.planner: false            # 发布规划器用点云
+    lio.output.map: true                 # 发布/lio/cloud_world
+    lio.output.dense: true               # true=发布去畸变全点云 false=发布降采样点云
+    lio.output.pub_step: 5             # 每隔N帧发布一次
+    lio.output.nav2_tf: true             # 发布 map→odom→base_link TF 用于 Nav2 导航
+
+    # ===================== 性能评估 ==============================
+    lio.eva.timer: true                  # 打印各模块耗时
+
+    # ===================== 重定位 ================================
+    lio.relocation.update_map: false     # 是否动态更新地图
+    # lio.relocation.init_pose: [68.138, -162.247, -5.045, 0.0, 0.0, -0.017]  # 初始位姿 [x,y,z,roll,pitch,yaw]
+    lio.relocation.init_pose: [90.655, -216.845, -7.111, 0.0, 0.0, -91.3]
+    # lio.relocation.init_pose: [50.716, 33.496, 44.762, 0.0, 0.0, 103.21]
+    # ---- 多分辨率NDT级联 ----
+    lio.relocation.enable_multi_res: true   # 启用粗→中→精三级配准
+    lio.relocation.target_ds_size: 0.5      # 精匹配目标地图降采样分辨率(m)
+    lio.relocation.ndt_resolution: 1.0      # 精匹配NDT分辨率(m)
+    lio.relocation.icp_max_corr: 8.0        # ICP最大对应距离(m)
+    lio.relocation.icp_max_iter: 40         # ICP最大迭代次数
+    lio.relocation.fitness_thresh: 1.5      # ICP fitness score 接受阈值
+    lio.relocation.multi_yaw_search: true   # 失败时尝试多yaw角搜索
+    lio.relocation.yaw_step_deg: 30.0       # yaw搜索步长(°)
+    lio.relocation.yaw_search_count: 6      # 每侧搜索yaw候选数
+    # ---- 多分辨率参数 ----
+    lio.relocation.coarse_ds_size: 1.5      # 粗匹配降采样(m)
+    lio.relocation.coarse_ndt_resolution: 5.0   # 粗匹配NDT分辨率(m)
+    lio.relocation.medium_ds_size: 0.8      # 中匹配降采样(m)
+    lio.relocation.medium_ndt_resolution: 2.0   # 中匹配NDT分辨率(m)
+    # ---- 鲁棒性 ----
+    lio.relocation.init_frames: 3           # 累积帧数（越少运动畸变越小）
+    lio.relocation.z_search_range: 2.0      # z偏移搜索范围(±m)
+    lio.relocation.z_search_step: 1.0       # z偏移搜索步长(m)
+    lio.relocation.min_overlap_ratio: 0.3   # ICP最小重叠率（0=禁用）
+
+    # ===================== 点-线边缘特征 =========================
+    lio.feature.enable_edge: true           # 启用边缘特征
+    lio.feature.edge_weight: 500.0          # 边缘观测权重（平面=1000）
+    lio.feature.edge_line_dist_thresh: 0.08 # 邻居点/扫描点到拟合线最大距离(m)，越小越严格
+    lio.feature.edge_linearity_ratio: 5.0   # λmax/λ2nd > 此值→线结构（fit_line_from_points内）
+    lio.feature.high_intensity_edge_boost: 3.0  # 高强点线特征额外倍数（反光柱纵向约束）
+
+    # ===================== 在线标定 (Phase 1) ====================
+    lio.calib.enable_online_calib: true     # 启用在线外参+时偏估计
+    lio.calib.ext_rot_rw: 1.7e-4            # 外参旋转随机游走(rad/√s) ≈0.01°/√s
+    lio.calib.ext_trans_rw: 1.0e-4          # 外参平移随机游走(m/√s) ≈0.1mm/√s
+    lio.calib.dt_rw: 1.0e-6                 # 时间偏移随机游走(s/√s) ≈1μs/√s
+
+    # ===================== 退化检测 ==============================
+    lio.degeneracy.enabled: false            # 启用退化检测
+    lio.degeneracy.max_stddev: 0.25          # 后验平移标准差>此值(m)→触发解映射
+    lio.degeneracy.htvh_cond_thresh: 30.0  # HTVH平移块条件数>此值→约束不均衡退化
