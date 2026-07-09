@@ -72,6 +72,9 @@
     lio.kf.kf_max_iterations: 6          # IEKF最大迭代次数
     lio.kf.kf_align_gravity: true        # 是否重力对齐初始化
     lio.kf.kf_quit_eps: 0.0001            # 迭代收敛阈值（dx无穷范数）
+    # ---- P 下界（协方差钳制）----
+    lio.kf.p_lower_bound.enabled: false   # 启用位置协方差下界 (σ_pos ≥ trans_sigma)
+    lio.kf.p_lower_bound.trans_sigma: 0.05  # 位置标准差下界(m)，默认5cm
 
     # ===================== 输出 ==================================
     lio.output.robot: false              # 发布机器人坐标系odom (/mavros/vision_pose)
@@ -89,8 +92,8 @@
     # ===================== 重定位 ================================
     lio.relocation.update_map: false     # 是否动态更新地图
     # lio.relocation.init_pose: [68.138, -162.247, -5.045, 0.0, 0.0, -0.017]  # 初始位姿 [x,y,z,roll,pitch,yaw]
-    lio.relocation.init_pose: [90.655, -216.845, -7.111, 0.0, 0.0, -91.3]
-    # lio.relocation.init_pose: [50.716, 33.496, 44.762, 0.0, 0.0, 103.21]
+    # lio.relocation.init_pose: [90.655, -216.845, -7.111, 0.0, 0.0, -91.3]
+    lio.relocation.init_pose: [50.716, 33.496, 44.762, 0.0, 0.0, 103.21]
     # ---- 多分辨率NDT级联 ----
     lio.relocation.enable_multi_res: true   # 启用粗→中→精三级配准
     lio.relocation.target_ds_size: 0.5      # 精匹配目标地图降采样分辨率(m)
@@ -126,6 +129,6 @@
     lio.calib.dt_rw: 1.0e-6                 # 时间偏移随机游走(s/√s) ≈1μs/√s
 
     # ===================== 退化检测 ==============================
-    lio.degeneracy.enabled: false            # 启用退化检测
+    lio.degeneracy.enabled: true            # 启用退化检测
     lio.degeneracy.max_stddev: 0.25          # 后验平移标准差>此值(m)→触发解映射
     lio.degeneracy.htvh_cond_thresh: 30.0  # HTVH平移块条件数>此值→约束不均衡退化

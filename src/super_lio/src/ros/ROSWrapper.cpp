@@ -320,6 +320,13 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<double>("lio.feature.high_intensity_edge_boost", 3.0);
   node.get_parameter("lio.feature.high_intensity_edge_boost", g_high_intensity_edge_boost);
 
+  // ================= P lower bound (covariance clamp) =================
+  node.declare_parameter<bool>("lio.kf.p_lower_bound.enabled", false);
+  node.get_parameter("lio.kf.p_lower_bound.enabled", g_p_lower_bound_enabled);
+
+  node.declare_parameter<double>("lio.kf.p_lower_bound.trans_sigma", 0.05);
+  node.get_parameter("lio.kf.p_lower_bound.trans_sigma", g_p_lower_bound_trans);
+
   // ================= degeneracy handling =================
   node.declare_parameter<bool>("lio.degeneracy.enabled", true);
   node.get_parameter("lio.degeneracy.enabled", g_degeneracy_enabled);

@@ -121,6 +121,10 @@ namespace LI2Sup{
   extern double g_edge_linearity_ratio;    // λ_max / λ_2nd > this in fit_line_from_points
   extern double g_high_intensity_edge_boost;  // extra multiplier for high-intensity edge features
 
+  /// P lower bound (covariance clamp)
+  extern bool   g_p_lower_bound_enabled;  // enable P lower bound clamping
+  extern double g_p_lower_bound_trans;    // min σ for position (m), e.g. 0.05 = 5cm
+
   /// degeneracy handling
   extern bool   g_degeneracy_enabled;
   extern double g_degeneracy_max_stddev;       // posterior σ > this (meters) → degenerate

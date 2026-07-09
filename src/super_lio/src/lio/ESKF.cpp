@@ -371,15 +371,17 @@ bool ESKF::Predict(const IMUData& imu) {
     P_(31, 31) += dt_rw * dt_rw;
   }
 
-  // P lower bounds — COMMENTED OUT: may cause systematic drift on return legs
-  // scalar p_min_pred_trans = degen_detected_ ? scalar(0.09) : scalar(2.5e-3);
-  // scalar p_min_pred_rot   = scalar(3.0e-6);
-  // for (int i = 3; i < 6; i++) {
-  //   if (P_(i, i) < p_min_pred_trans) P_(i, i) = p_min_pred_trans;
-  // }
-  // for (int i = 0; i < 3; i++) {
-  //   if (P_(i, i) < p_min_pred_rot) P_(i, i) = p_min_pred_rot;
-  // }
+  // P lower bounds (configurable via params)
+  if (g_p_lower_bound_enabled) {
+    scalar p_min_pred_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
+    scalar p_min_pred_rot   = scalar(3.0e-6);
+    for (int i = 3; i < 6; i++) {
+      if (P_(i, i) < p_min_pred_trans) P_(i, i) = p_min_pred_trans;
+    }
+    for (int i = 0; i < 3; i++) {
+      if (P_(i, i) < p_min_pred_rot) P_(i, i) = p_min_pred_rot;
+    }
+  }
 
   global_acc_ = R_.R() * acc + g_;
   p_ = p_ + v_ * dt + 0.5 * global_acc_ * dt * dt;
@@ -436,8 +438,6 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     // Pose solved in 33×33 (well-conditioned: P is block-diagonal).
     // Calibration solved separately after IEKF loop (15×15 system).
 
-    Qk = Pk_inv.inverse();
-
     STATE error_dx = STATE::Zero();
     error_dx.template block<6,1>(0, 0) = HTVr_pose;
 
@@ -445,6 +445,32 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     // P is block-diagonal (pose ⟂ calib), so the 33×33 inverse is well-conditioned.
     Qk = Pk_inv.inverse();
     dx_ = Qk * error_dx;
+
+    // ── DEBUG: solver health + Δx longitudinal tracking ──
+    {
+      static int solver_diag = 0;
+      static double cum_dx_long = 0.0;
+      solver_diag++;
+      // Condition number of the 33×33 IEKF system (Pk⁻¹ + HᵀWH)
+      Eigen::JacobiSVD<COV> svd(Pk_inv);
+      double cond_Pkinv = svd.singularValues()(0)
+                        / (svd.singularValues()(svd.singularValues().size()-1) + 1e-30);
+      // Eigenvalues of the 3×3 translation block of HTVH
+      Eigen::SelfAdjointEigenSolver<M3d> eig_HTVH(HTVH_pose.block<3,3>(3,3).cast<double>());
+      V3d ev_H = eig_HTVH.eigenvalues();
+      // Longitudinal Δx — use eigenvector of weakest HTVH direction
+      V3d weak_dir = eig_HTVH.eigenvectors().col(0);
+      double dx_long = std::abs(dx_.segment<3>(3).cast<double>().dot(weak_dir));
+      cum_dx_long += dx_long;
+
+      if (solver_diag <= 5 || solver_diag % 200 == 0) {
+        LOG(INFO) << "[SolverDiag#" << solver_diag << "]"
+                  << " cond(P⁻¹+H)=" << cond_Pkinv
+                  << " ev_HTVH=[" << ev_H(0) << " " << ev_H(1) << " " << ev_H(2) << "]"
+                  << " dx_long=" << dx_long << " cum_dx_long=" << cum_dx_long
+                  << " P_lb=" << (g_p_lower_bound_enabled ? "ON" : "OFF");
+      }
+    }
 
     // solution remapping for degeneracy (uses posterior translation covariance + HTVH condition)
     RemapDegeneracy(Qk.block<3, 3>(3, 3), HTVH_pose, dx_);
@@ -524,17 +550,17 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   P_ = Pk;
 
-  // P lower bounds — COMMENTED OUT: may cause systematic drift on return legs
-  // {
-  //   scalar p_min_trans = degen_detected_ ? scalar(0.09) : scalar(2.5e-3);
-  //   scalar p_min_rot   = scalar(3.0e-6);
-  //   for (int i = 3; i < 6; i++) {
-  //     if (P_(i, i) < p_min_trans) P_(i, i) = p_min_trans;
-  //   }
-  //   for (int i = 0; i < 3; i++) {
-  //     if (P_(i, i) < p_min_rot) P_(i, i) = p_min_rot;
-  //   }
-  // }
+  // P lower bounds (configurable via params)
+  if (g_p_lower_bound_enabled) {
+    scalar p_min_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
+    scalar p_min_rot   = scalar(3.0e-6);
+    for (int i = 3; i < 6; i++) {
+      if (P_(i, i) < p_min_trans) P_(i, i) = p_min_trans;
+    }
+    for (int i = 0; i < 3; i++) {
+      if (P_(i, i) < p_min_rot) P_(i, i) = p_min_rot;
+    }
+  }
 
   dx_.setZero();
 

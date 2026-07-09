@@ -85,6 +85,10 @@ namespace LI2Sup{
 
   ResidualType g_residual_type = PROB;
 
+  /// P lower bound (covariance clamp)
+  bool   g_p_lower_bound_enabled = false;
+  double g_p_lower_bound_trans = 0.05;  // σ_pos ≥ 5cm
+
   /// online calibration
   bool   g_enable_online_calib = true;
   double g_calib_ext_rot_rw   = 1.7e-4;   // ~0.01°/√s
