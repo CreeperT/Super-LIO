@@ -13,6 +13,7 @@ namespace LI2Sup{
 
   /// evaluation
   bool g_time_eva = false;
+  bool g_verbose_logging = false;  // per-frame diagnostic logs (off by default)
 
   bool   g_save_map;
   bool   g_if_filter; 

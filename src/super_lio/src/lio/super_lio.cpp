@@ -274,7 +274,8 @@ void SuperLIO::stateProcess(){
   caceData();
 
   // ── Map reset on persistent degeneracy ──
-  if (kf_->shouldResetMap()) {
+  // In relocation mode, the prior map is the only reference — never clear it.
+  if (allow_map_reset_ && kf_->shouldResetMap()) {
     LOG(WARNING) << YELLOW << " ---> [LIO] Resetting map (degeneracy)."
                  << RESET;
     ivox_->clear();

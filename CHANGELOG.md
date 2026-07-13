@@ -1,5 +1,49 @@
 # CHANGELOG
 
+## 2026-07-13: 诊断日志开关 + CHANGELOG 整理
+
+- 新增 `lio.eva.verbose_logging` 参数（默认 false），控制逐帧诊断日志
+- 受控日志: `[P_lb]` σ 追踪、κ 门槛 INFO、重定位 init 状态
+- WARNING/ERROR 日志始终输出
+
+**涉及文件**: `params.h/cpp`, `ROSWrapper.cpp`, `b2.yaml`, `ESKF.cpp`, `super_lio_reloc.cpp`
+
+---
+
+## 2026-07-10: 修复重定位返程漂移 — 地图重置 + κ投影 + UpdateMap 三合一
+
+### 根因分析（日志时间线）
+
+```
+帧#1-1000  : ev_HTVH λmin=30000~110000, 跟踪正常, σ<0.05m
+帧#~1100   : ev_HTVH λmin 骤降至 3814, κ>30 首次触发
+              → κ投影抑制最弱方向dx → 状态开始漂移
+帧#~1200   : 连续100帧κ退化 → 地图重置触发
+              → ivox_->clear() 清空先验地图（重定位唯一参考）
+帧#1206+   : 观测恢复但地图为空 → σ 从0.04m爆炸至150m+ → 死亡螺旋
+```
+
+### 修复1: κ投影加绝对λmin门槛 (ESKF.cpp)
+- 保留 κ+σ 四象限联合检测设计
+- κ大σ小 时不再无条件投影，改为检查 λmin 绝对值
+- λmin < 500（观测精度>4.5cm）→ 真正弱约束 → κ投影生效
+- λmin ≥ 500 → 约束充足仅不平衡 → 不投影
+- 消除线特征+标定同时开启时 κ 虚高导致的误投影
+
+### 修复2: 重定位模式禁止地图重置 (super_lio.h/cpp, super_lio_reloc.cpp)
+- 新增 `allow_map_reset_` 标志（默认true）
+- 重定位 `init()` 设为 `false`
+- 地图重置在SLAM模式安全（在线重建），在重定位模式致命（唯一参考被清空）
+
+### 修复3: UpdateMap逻辑修正 (super_lio_reloc.cpp)
+- `g_update_map=false` 时直接return，不插入运行时点云
+- 防止先验地图被位姿误差污染
+- `g_update_map=true` 时行为不变（100帧延迟后开始更新）
+
+**涉及文件**: `ESKF.cpp`, `super_lio.h`, `super_lio.cpp`, `super_lio_reloc.cpp`
+
+---
+
 ## 2026-07-06: 返程漂移根因定位 + 修复
 
 ### 返程漂移根因

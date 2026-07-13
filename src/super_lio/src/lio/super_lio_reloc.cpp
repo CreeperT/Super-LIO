@@ -95,7 +95,17 @@ void SuperLIOReLoc::init(){
 
   kf_->setCalibEnabled(g_enable_online_calib);
 
-  LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized." << RESET;
+  // Relocation uses a prior map as the sole reference — clearing it is fatal.
+  allow_map_reset_ = false;
+
+  if (g_verbose_logging) {
+    LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized. "
+              << "P_lb=" << (g_p_lower_bound_enabled ? "ON" : "OFF")
+              << " σ=" << g_p_lower_bound_trans
+              << " calib=" << (g_enable_online_calib ? "ON" : "OFF")
+              << " degen=" << (g_degeneracy_enabled ? "ON" : "OFF")
+              << RESET;
+  }
 
   auto start_time = std::chrono::high_resolution_clock::now();
   SuperLIOReLoc::map_init();
@@ -565,29 +575,31 @@ bool SuperLIOReLoc::kf_init(){
 
 
 void SuperLIOReLoc::UpdateMap() {
-  if(g_update_map){
-    static int __update_delay = 100;
-    if(__update_delay > 0){
-      __update_delay--;
-      std::cout << "Update map Delay: " << 100 - __update_delay << " %" << std::endl;
-      return;
-    }
+  // In relocation mode, the prior map should remain static.
+  // Only update when explicitly enabled (e.g. for dynamic environments).
+  if (!g_update_map) return;
+
+  static int __update_delay = 100;
+  if (__update_delay > 0) {
+    __update_delay--;
+    std::cout << "Update map Delay: " << 100 - __update_delay << " %" << std::endl;
+    return;
   }
 
   const size_t ptsize = ds_undistort_->size();
   if (ptsize == 0) return;
-  
+
   last_pose_ = kf_->GetSE3();
   points_world_v3_.resize(ptsize);
-  
+
   const auto R = last_pose_.R_;
   const auto t = last_pose_.t_;
-  
+
   for (size_t i = 0; i < ptsize; ++i) {
     const auto& pt = points_body_v3_[i];
     points_world_v3_[i] = R * pt + t;
   }
-  
+
   ivox_->insert(points_world_v3_);
 
 }

@@ -84,6 +84,7 @@ protected:
   std::vector<BASIC::V3> line_center_vec_;
   int pcd_index_ = -1;
   int skip_observe_frames_ = 0;  // frames to skip Observe after map reset
+  bool allow_map_reset_ = true;  // relocation mode sets this to false
 
   Timer time_record_;
 };

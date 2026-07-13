@@ -189,14 +189,47 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
   }
 
   // ── Check 2: HTVH condition number ──
+  // κ detects constraint IMBALANCE → warns that the weakest observation
+  // direction may be unreliable. But κ alone is not enough: strong edge
+  // features + calibration inflate λ_max, making κ large even when λ_min
+  // provides adequate precision. Gate with an ABSOLUTE threshold on λ_min.
+  //
+  // Four-quadrant joint detection (κ + σ):
+  //   κ小 σ小 → normal (no projection)
+  //   κ大 σ小 → λ_min gate: project only if genuinely weak
+  //   κ小 σ大 → σ projection (prior uncertainty)
+  //   κ大 σ大 → σ + κ projection (both degraded)
+  //
+  // λ_min < 500: observation precision > 4.5cm → untrustworthy
+  static constexpr double HTVH_MIN_EV_THRESH = 500.0;
   int cond_count = 0;
   if (currently_degenerate) {
-    cond_count = 1;
-    V3d weak_dir = eig_H.eigenvectors().col(0);
-    V_f += weak_dir * weak_dir.transpose();
+    double ev_min = std::max(0.0, ev_H(0));
+    if (ev_min < HTVH_MIN_EV_THRESH) {
+      // Genuinely weak constraint — projection justified
+      cond_count = 1;
+      V3d weak_dir = eig_H.eigenvectors().col(0);
+      V_f += weak_dir * weak_dir.transpose();
+      LOG(WARNING) << "[ESKF] Degeneracy (κ): HTVH_trans κ=" << cond_H
+                   << " > " << degen_opts_.htvh_cond_thresh
+                   << " λ_min=" << ev_min << " < " << HTVH_MIN_EV_THRESH
+                   << " | ev_H=[" << ev_H(0) << ", " << ev_H(1) << ", " << ev_H(2) << "]"
+                   << " | suppressed weakest direction";
+    } else {
+      // Imbalanced but adequate — log only when verbose
+      if (g_verbose_logging) {
+        static int kappa_info_count = 0;
+        if (++kappa_info_count <= 3 || kappa_info_count % 200 == 0) {
+          LOG(INFO) << "[ESKF] HTVH κ=" << cond_H
+                    << " > " << degen_opts_.htvh_cond_thresh
+                    << " λ_min=" << ev_min << " ≥ " << HTVH_MIN_EV_THRESH
+                    << " | adequate, no projection";
+        }
+      }
+    }
   }
 
-  // ── Apply projection ──
+  // ── Apply projection (σ + gated-κ) ──
   if (sigma_count > 0 || cond_count > 0) {
     degen_detected_ = true;
 
@@ -218,12 +251,6 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
                    << ", " << std::sqrt(std::max(0.0, ev_Q(1)))
                    << ", " << std::sqrt(std::max(0.0, ev_Q(2))) << "]m"
                    << " > " << degen_opts_.max_trans_stddev << "m";
-    }
-    if (cond_count > 0) {
-      LOG(WARNING) << "[ESKF] Degeneracy (κ): HTVH_trans κ=" << cond_H
-                   << " > " << degen_opts_.htvh_cond_thresh
-                   << " | ev_H=[" << ev_H(0) << ", " << ev_H(1) << ", " << ev_H(2) << "]"
-                   << " | suppressed weakest direction";
     }
   }
 }
@@ -551,6 +578,17 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   P_ = Pk;
 
   // P lower bounds (configurable via params)
+  if (g_verbose_logging) {
+    scalar cur_trans_sigma = scalar(std::sqrt(std::max(scalar(0),
+        (P_(3,3) + P_(4,4) + P_(5,5)) / scalar(3))));
+    static scalar min_trans_sigma_seen = cur_trans_sigma;
+    if (cur_trans_sigma < min_trans_sigma_seen) {
+      min_trans_sigma_seen = cur_trans_sigma;
+      LOG(INFO) << "[P_lb] new min σ_trans=" << min_trans_sigma_seen
+                << "m (lb=" << g_p_lower_bound_trans << "m, "
+                << (g_p_lower_bound_enabled ? "ON" : "OFF") << ")";
+    }
+  }
   if (g_p_lower_bound_enabled) {
     scalar p_min_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
     scalar p_min_rot   = scalar(3.0e-6);

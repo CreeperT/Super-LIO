@@ -19,6 +19,9 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<bool>("lio.eva.timer", false);
   node.get_parameter("lio.eva.timer", g_time_eva);
 
+  node.declare_parameter<bool>("lio.eva.verbose_logging", false);
+  node.get_parameter("lio.eva.verbose_logging", g_verbose_logging);
+
   node.declare_parameter<bool>("lio.map.if_filter", false);
   node.get_parameter("lio.map.if_filter", g_if_filter);
 
