@@ -911,8 +911,27 @@ void SuperLIO::Observe(){
       _effect_knn_num++;
     }
 
-    // LOG(INFO) << "effect_knn_num_: " << effect_knn_num_ << ", _effect_knn_num: " << _effect_knn_num;
     effect_knn_num_ = _effect_knn_num;
+
+    // ── Per-frame feature diagnostics (verbose only) ──
+    if (g_verbose_logging) {
+      static int feat_diag_count = 0;
+      if (++feat_diag_count <= 5 || feat_diag_count % 200 == 0) {
+        int edge_count = 0;
+        for (size_t i = 0; i < ptsize; ++i)
+          if (edge_mask_[i]) edge_count++;
+        int plane_count = 0;
+        for (size_t i = 0; i < ptsize; ++i)
+          if (effect_mask_[i]) plane_count++;
+
+        LOG(INFO) << "[FeatDiag#" << feat_diag_count << "]"
+                  << " pts=" << ptsize
+                  << " knn_valid=" << effect_knn_num_
+                  << " plane=" << plane_count
+                  << " edge=" << edge_count
+                  << " |HTVr|=" << sum_HTVr.norm();
+      }
+    }
 
     iter_num++;
   });
