@@ -192,7 +192,7 @@ $$\mathbf{H}^\top\mathbf{V}\mathbf{H} = \sum_i w_i \mathbf{J}_i \mathbf{J}_i^\to
 
 多传感器系统的观测残差由位姿误差与标定误差（外参与时偏）两类来源叠加而成。位姿误差为动态量，随运动与场景变化剧烈，对残差的贡献可达米级；标定误差为静态量，仅随温度、振动等因素缓慢漂移，对残差的贡献为毫米至亚毫米级。二者在数量级上天然相差三至四个数量级。若将全部观测在单次线性求解中联合处理，量级较小的标定分量将被位姿残差淹没，导致标定收敛缓慢甚至发散。两步法的设计依据来自观测系统的三个结构特征：其一，观测雅可比具有稀疏性，每个残差仅与一个雷达的外参块相关联，两个外参块在观测维度上不相交；其二，上述量级差异使迭代初期自然由位姿修正主导；其三，导航误差状态经 IMU 运动学积分形成密集的内部耦合，而导航误差与标定误差之间的协方差耦合远弱于导航子空间内部的耦合。
 
-据此，求解分两步进行。第一步（Phase 1）以导航优先方式求解位姿，标定观测暂不入阵，标定误差状态仅经先验协方差的非对角块获得软跟随修正；待位姿收敛后，第二步（Phase 2）在隔离了位姿噪声的 14 维标定子空间中对标定误差状态进行精修。该策略将全 32 维联合求解分解为规模分别为 18×18 与 14×14 的两个线性系统，前者保证位姿估计的实时收敛，后者在无位姿噪声干扰的条件下恢复标定的可辨识性。需要指出，该分解为软解耦而非完全解耦。完全解耦意味着两子系统在求解与信息层面均相互独立，在此并不可行，因为导航子空间内部的位置-速度-零偏-重力耦合密集，位姿残差须经导航子空间内的协方差传播方可间接修正这些维度。因此本方法对 14 维标定子空间执行舒尔补边缘化，将其协方差信息精确吸收进导航子空间后求解 18×18 导航系统，数学上等价于全 32 维求解而计算量更低；Phase 2 再于导航收敛后求解 14×14 标定子系统，其先验协方差携带 Phase 1 传播的耦合信息。两阶段仅在求解层面相互隔离，信息层面零损失。
+据此，求解分两步进行。第一步（Phase 1）在 18 维导航子空间中对导航误差状态（位姿、速度、零偏、重力）进行求解，标定观测暂不入阵；待导航状态收敛后，第二步（Phase 2）在隔离了导航噪声的 14 维标定子空间中对标定误差状态进行精修。该策略将全 32 维联合求解分解为规模分别为 18×18 与 14×14 的两个线性系统，前者保证导航估计的实时收敛，后者在无导航噪声干扰的条件下恢复标定的可辨识性。两步之间为软解耦：对 14 维标定子空间执行舒尔补边缘化，将其协方差信息精确吸收进导航先验后求解 18×18 导航系统，数学上等价于全 32 维求解而计算量更低；Phase 2 再于导航收敛后求解 14×14 标定子系统。两阶段仅在求解层面相互隔离，协方差更新采用全 32×32 Joseph 形式 $\mathbf{P} \leftarrow (\mathbf{I} - \mathbf{K}\mathbf{H})\mathbf{P}$，交叉协方差块在更新中同步传播，信息层面零损失。
 
 ### 4.3.2 求解过程
 
@@ -222,11 +222,11 @@ $$\mathbf{S}_{\text{calib}} = \mathbf{P}|_{(18:31, 18:31)}^{-1} + \mathbf{H}^\to
 
 $$\Delta\mathbf{x}_{\text{calib}} = \mathbf{S}_{\text{calib}}^{-1} \cdot \mathbf{b}_{\text{calib}}$$
 
-最后更新后验协方差。导航子空间按信息形式更新整个 18×18 块，其中位姿观测信息以 $\mathbf{M}_{\text{pose}}$ 填充（仅在位姿 6×6 子块非零）；标定子块按信息形式更新为 $\mathbf{S}_{\text{calib}}^{-1}$：
+最后以 Joseph 形式更新后验协方差。将解耦后的 Kalman gain 提升至 32 维（导航块为 $\mathbf{Q}_{\text{nav}}\mathbf{M}_{\text{nav}}$，标定块为 $\mathbf{0}$），一次性更新全 32×32 协方差矩阵：
 
-$$\mathbf{P}_{(0:17, 0:17)} \leftarrow \big(\mathbf{P}_{(0:17, 0:17)}^{-1} + \mathbf{M}_{\text{pose}}\big)^{-1}, \quad \mathbf{P}_{(18:31, 18:31)} \leftarrow \mathbf{S}_{\text{calib}}^{-1}$$
+$$\mathbf{K}_{\text{32}} = \text{blockdiag}\big(\mathbf{Q}_{\text{nav}}\mathbf{M}_{\text{nav}},\; \mathbf{0}_{14\times 14}\big), \quad \mathbf{P} \leftarrow (\mathbf{I}_{32} - \mathbf{K}_{\text{32}}) \mathbf{P}_{\text{prior}}$$
 
-其中 $\mathbf{M}_{\text{pose}}$ 为 $\mathbf{H}^\top\mathbf{V}\mathbf{H}|_{(0:5,0:5)}$ 在 18×18 导航块上的零填充，该更新在精确算术下与 Joseph 形式 $(I - \mathbf{K}\mathbf{H})\mathbf{P}$ 等价。交叉协方差块随上述更新经矩阵乘法同步传播，使 Phase 2 的标定先验携带 Phase 1 的信息。
+其中 $\mathbf{M}_{\text{nav}}$ 为 $\mathbf{H}^\top\mathbf{V}\mathbf{H}|_{(0:5,0:5)}$ 在 18×18 导航块上的零填充。标定子块在 Phase 2 以 Joseph 形式独立更新为 $\mathbf{P}_{(18:31, 18:31)} \leftarrow (\mathbf{I}_{14} - \mathbf{K}_{\text{calib}}\mathbf{H}_{\text{calib}}) \mathbf{P}_{\text{calib}}$。导航子空间和标定子空间的交叉协方差块经全 32×32 乘法同步传播。
 
 上述各步的设计依据与数值论证详见 §4.3.3。
 
@@ -313,10 +313,10 @@ $\mathbf{P}^{-1}$ 在导航子空间（18 维）内部是**稠密**的。IMU 预
 
 选择 LDL^T 的原因在于，$\mathbf{S}_{\text{calib}} = \mathbf{P}_{\text{calib}}^{-1} + \mathbf{H}^\top\mathbf{V}\mathbf{H}|_{\text{calib}}$ 由两项叠加而成，且 $\mathbf{P}_{\text{calib}}$ 经随机游走预测协方差累积后，在退化方向（如平地场景的 pitch）条件数升高。标准 Cholesky 分解 $\mathbf{A} = \mathbf{L}\mathbf{L}^\top$ 需求 $\mathbf{A}$ 严格正定且在近奇异方向上涉及开根号 $\sqrt{a_{ii} - \sum l_{ik}^2}$，条件数高时精度损失显著。LDL^T 分解 $\mathbf{A} = \mathbf{L}\mathbf{D}\mathbf{L}^\top$ 避免开根号，对条件数较差的矩阵数值稳定性更好。
 
-$\mathbf{S}_{\text{calib}}$ 的 ext1↔ext2 off-diagonal 块非零，因此必须稠密求解，其非零性来自两个来源：
+$\mathbf{S}_{\text{calib}}$ 的 ext1↔ext2 off-diagonal 块非零，因此必须稠密求解，其非零性来自：
 
-1. $\mathbf{P}_{\text{calib}}^{-1}$ 中经多次预测-更新循环累积的传感器间协方差，其初始值为零，但随机游走与 Phase 1 软跟随在多帧迭代后使 off-diagonal 逐渐稠密化
-2. Phase 1 的协方差更新 $(I - \mathbf{K}\mathbf{H})\mathbf{P}$ 过程中，交叉协方差块将位姿观测信息传播至标定子空间
+1. $\mathbf{P}_{\text{calib}}^{-1}$ 中经多次预测-更新循环累积的传感器间协方差，随机游走与 Phase 2 自身 Joseph 更新在多帧迭代后使 off-diagonal 逐渐稠密化
+2. Phase 1 的协方差更新 $(\mathbf{I}_{32} - \mathbf{K}_{\text{32}})\mathbf{P}$ 通过全 32×32 乘法将导航观测信息传播至标定子空间的交叉协方差块
 
 因此标定子系统不能拆分为两个独立的 7×7 求解，而应采用 14×14 稠密 LDL^T。
 
@@ -349,14 +349,19 @@ if (calib_s0_ > 1.0) {
 
 ---
 
-**Step 9：为什么用信息形式而非 Joseph 形式更新协方差**
+**Step 9：为什么用 Joseph 形式而非信息形式更新协方差**
 
 IEKF 的后验协方差有两种等价形式：
 
 - Joseph 形式，即 $\mathbf{P}_{\text{post}} = (\mathbf{I} - \mathbf{K}\mathbf{H})\mathbf{P}_{\text{prior}}(\mathbf{I} - \mathbf{K}\mathbf{H})^\top + \mathbf{K}\mathbf{R}\mathbf{K}^\top$；
 - 信息形式，即 $\mathbf{P}_{\text{post}} = (\mathbf{P}_{\text{prior}}^{-1} + \mathbf{H}^\top\mathbf{W}\mathbf{H})^{-1}$
 
-在 IEKF 框架下两者精确等价。信息形式的优势在于 $\mathbf{P}_{\text{prior}}^{-1} + \mathbf{H}^\top\mathbf{W}\mathbf{H}$ 本身就是更新后的信息矩阵，从而避免 Joseph 形式中 $\mathbf{K}\mathbf{H}$ 的 18×18 矩阵-矩阵乘法开销（$\sim 18^3$ 运算），并直接复用 Phase 1/2 中已计算好的求逆/分解结果。对于本系统的维度（18 和 14），节省的运算量约 $18^3 / 3 \approx 2$k FLOPs，在 200 Hz LiDAR 帧率下不可忽略。
+两步解耦架构下选择 Joseph 形式的原因如下。信息形式更新仅作用于观测信息非零的维度，即 $\mathbf{P}_{(0:5,0:5)}$ 和 $\mathbf{P}_{(18:31,18:31)}$，导航子空间内 v/bg/ba/g 维度与标定子空间之间的交叉协方差块不会自动更新。Joseph 形式将解耦后的 Kalman gain 提升至 32 维做全矩阵乘法 $\mathbf{P} \leftarrow (\mathbf{I}_{32} - \mathbf{K}_{\text{32}})\mathbf{P}$，一步完成所有块的传播：
+
+$$\mathbf{P}_{\text{post}}^{(0:17, 0:17)} = (\mathbf{I} - \mathbf{K}_{\text{nav}}\mathbf{H}_{\text{pose}}) \cdot \mathbf{P}_{\text{prior}}^{(0:17, 0:17)}$$
+$$\mathbf{P}_{\text{post}}^{(0:17, 18:31)} = (\mathbf{I} - \mathbf{K}_{\text{nav}}\mathbf{H}_{\text{pose}}) \cdot \mathbf{P}_{\text{prior}}^{(0:17, 18:31)}$$
+
+速度、零偏、重力的协方差通过导航子空间内部 off-diagonal 耦合获得间接修正（$\mathbf{P}_{\text{prior}}^{-1}$ 中位置-速度-零偏-重力块稠密），交叉协方差经 $\mathbf{I} - \mathbf{K}_{\text{nav}}\mathbf{H}_{\text{pose}}$ 同步缩放，保证 Phase 2 的标定先验携带最新信息。对于约瑟夫形式中省略的 $(\mathbf{I}-\mathbf{K}\mathbf{H})^\top$ 因子和 $\mathbf{K}\mathbf{R}\mathbf{K}^\top$ 项：前者在标定子空间 Kalman gain 为零时无影响；后者的量级为 $\mathbf{Q}_{\text{nav}}\mathbf{M}_{\text{nav}}\mathbf{Q}_{\text{nav}}$（$\sim 10^{-2}$），在 LiDAR 特征点累积的高斯-牛顿近似精度下可忽略。
 
 ---
 
