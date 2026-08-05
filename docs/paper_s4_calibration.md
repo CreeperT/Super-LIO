@@ -196,9 +196,9 @@ $$\mathbf{H}^\top\mathbf{V}\mathbf{H} = \sum_i w_i \mathbf{J}_i \mathbf{J}_i^\to
 
 ### 4.3.2 求解过程
 
-单帧观测的求解分为两步，分别对应导航优先的位姿估计与标定误差的后验修正。
+单帧观测的求解分为两步，分别对应导航优先的状态估计与标定误差的后验修正。
 
-**第一步（Phase 1）：导航优先的位姿估计。** 首先将先验协方差经旋转重参数化投影至当前切空间：
+**第一步（Phase 1）：导航优先的状态估计。** 首先将先验协方差经旋转重参数化投影至当前切空间：
 
 $$\mathbf{J}_\theta = \mathbf{I}_3 - \frac{1}{2}(\hat{\boldsymbol{\theta}})^\wedge, \quad \mathbf{P} \leftarrow \mathbf{J}_\theta \mathbf{P} \mathbf{J}_\theta^\top$$
 
@@ -212,7 +212,7 @@ $$\mathbf{S}_{\text{nav}} = \bar{\mathbf{P}}_{\text{nav}}^{-1}, \quad \mathbf{S}
 
 $$\Delta\mathbf{x}_{\text{nav}} = \mathbf{S}_{\text{nav}}^{-1} \cdot \mathbf{b}_{\text{nav}}, \quad \mathbf{R} \leftarrow \mathbf{R} \cdot \exp(\Delta\boldsymbol{\theta}), \quad \mathbf{t} \leftarrow \mathbf{t} + \mathbf{R} \cdot \Delta\mathbf{p}$$
 
-重复迭代直至修正量收敛。该 18×18 求解经舒尔补边缘化精确保留导航-标定耦合，与全 32×32 求解数学等价，而计算量由 $O(32^3)$ 降至 $O(14^3 + 18^3)$。此阶段标定观测不入阵，标定误差状态仅经协方差非对角块获得间接修正。
+重复迭代直至修正量收敛。该 18×18 求解经舒尔补边缘化精确保留导航-标定耦合，与全 32×32 求解数学等价，而计算量由 $O(32^3)$ 降至 $O(14^3 + 18^3)$。此阶段标定观测不入阵，标定维度的误差状态保持为零（$\Delta\mathbf{x}_{\text{calib}} = \mathbf{0}$）；导航-标定交叉协方差 $\mathbf{P}_{nc}$ 在初始对角 $\mathbf{P}$ 下恒为零，经 Joseph 更新 $(\mathbf{I} - \mathbf{K}_{\text{nav}}\mathbf{H}_{\text{pose}}) \cdot \mathbf{0} = \mathbf{0}$ 在全部帧中维持零值，验证见 §4.3.3 Step 4。
 
 **第二步（Phase 2）：标定后验修正。** 位姿收敛后，提取 14 维标定子块，将标定观测信息叠加至标定先验信息之上：
 
@@ -375,7 +375,7 @@ $$\delta\mathbf{x} = [\delta\mathbf{x}_{\text{nav}}^\top, \boldsymbol{\xi}_1^\to
 
 ### 4.4.2 两步法的 Scaling 性质
 
-- Phase 1 中，导航子空间固定为 18×18，全部标定维度（$7N$）经舒尔补边缘化吸收，求逆标度恒为 $O(18^3)$，与雷达数量无关；新增雷达的标定维度通过边缘化耦合获得间接修正，这与双雷达时的软跟随机制一致。
+- Phase 1 中，导航子空间固定为 18×18，求解标度恒为 $O(18^3)$；舒尔补边缘化所需的标定块分解标度为 $O((7N)^3)$。新增雷达的标定不确定性经舒尔补精确吸收进导航先验，保证导航求解的数学等价性不随雷达数量退化；标定维度的误差状态在 Phase 1 中保持为零（与双雷达情形一致，$\mathbf{P}_{nc} = \mathbf{0}$ 导致交叉协方差传播恒为零），其修正完全留待 Phase 2。
 - Phase 2 中，标定子块变为 $(6N + N) \times (6N + N) = 7N \times 7N$ 稠密系统，标度 $O(N^3)$：
 
 | $N$ | 标定维度 | LDL^T 规模 | 相对开销 |
