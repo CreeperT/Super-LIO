@@ -15,9 +15,13 @@ public:
 
   static constexpr int CORE_DIM   = 18;  // R(3) p(3) v(3) bg(3) ba(3) g(3)
   static constexpr int EXTRIN_DIM = 12;  // T_ext1(6) T_ext2(6)
-  static constexpr int TIME_DIM   = 3;   // dt1(1) dt2(1) + padding
-  static constexpr int STATE_DIM_ = CORE_DIM + EXTRIN_DIM + TIME_DIM;  // 33
-  static constexpr int OBS_DIM    = 6 + EXTRIN_DIM + TIME_DIM;         // 21
+  static constexpr int TIME_DIM   = 2;   // dt1(1) dt2(1)
+  static constexpr int STATE_DIM_ = CORE_DIM + EXTRIN_DIM + TIME_DIM;  // 32
+  static constexpr int OBS_DIM    = 6 + EXTRIN_DIM + TIME_DIM;         // 20
+
+  // Two-step decoupling: navigation (18×18) + calibration (14×14)
+  static constexpr int NAV_DIM   = CORE_DIM;                       // 18
+  static constexpr int CALIB_DIM = EXTRIN_DIM + TIME_DIM;          // 14
 
   using STATE = Eigen::Matrix<BASIC::scalar, STATE_DIM_, 1>;
   using STATE_DOF = Eigen::Matrix<BASIC::scalar, 17, 1>;
@@ -25,6 +29,11 @@ public:
   using COV   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, STATE_DIM_>;
   using F_X   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, STATE_DIM_>;
   using F_W   = Eigen::Matrix<BASIC::scalar, STATE_DIM_, 12>;
+
+  using NAV_MAT = Eigen::Matrix<BASIC::scalar, NAV_DIM, NAV_DIM>;
+  using NAV_VEC = Eigen::Matrix<BASIC::scalar, NAV_DIM, 1>;
+  using CALIB_MAT = Eigen::Matrix<BASIC::scalar, CALIB_DIM, CALIB_DIM>;
+  using CALIB_VEC = Eigen::Matrix<BASIC::scalar, CALIB_DIM, 1>;
 
 
   struct Options {

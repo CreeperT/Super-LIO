@@ -31,6 +31,7 @@ namespace LI2Sup{
   /// evaluation
   extern bool g_time_eva;
   extern bool g_verbose_logging;  // enable per-frame diagnostic logs
+  extern bool g_decouple_verify;  // compare 18×18 decoupled vs 32×32 full solve
 
   extern bool g_save_map;
   extern bool g_if_filter;

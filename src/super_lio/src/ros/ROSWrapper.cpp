@@ -1,6 +1,7 @@
 
 #include "ros/ROSWrapper.h"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include <iomanip>
 #include <pcl/common/transforms.h>
 
 
@@ -21,6 +22,9 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<bool>("lio.eva.verbose_logging", false);
   node.get_parameter("lio.eva.verbose_logging", g_verbose_logging);
+
+  node.declare_parameter<bool>("lio.eva.decouple_verify", false);
+  node.get_parameter("lio.eva.decouple_verify", g_decouple_verify);
 
   node.declare_parameter<bool>("lio.map.if_filter", false);
   node.get_parameter("lio.map.if_filter", g_if_filter);

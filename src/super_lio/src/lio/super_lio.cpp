@@ -7,6 +7,8 @@
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
 
+#include <pcl/kdtree/kdtree_flann.h>  // Phase 2: KD-tree for point motion matching
+
 
 using namespace BASIC;
 
@@ -460,6 +462,7 @@ void SuperLIO::Propagation_Undistort(){
 
     std::size_t ptsize = raw_pc->points.size();
     scan_undistort_full_->resize(ptsize);
+    full_motion_info_.resize(ptsize);  // Phase 2: per-point velocity for time-offset Jacobian
 
     tbb::parallel_for(
     tbb::blocked_range<size_t>(0, ptsize),
@@ -469,13 +472,15 @@ void SuperLIO::Propagation_Undistort(){
         auto& pt_full = scan_undistort_full_->points[idx];
         const auto& pt = raw_pc->points[idx];
         pt_full.intensity = pt.intensity;
-        double query_time = start_time + pt.offset_time;
+        double query_time = start_time + pt.offset_time + kf_->getDeltaT1();
         if (query_time > propagate_states_.back().time) {
           V3 raw(pt.x, pt.y, pt.z);
           V3 eigen_point = TLI_R * raw + TLI_t;
           pt_full.x = eigen_point[0];
           pt_full.y = eigen_point[1];
           pt_full.z = eigen_point[2];
+          full_motion_info_[idx].query_time = query_time;
+          full_motion_info_[idx].v_body = V3::Zero();
           continue;
         }
         auto match_iter = propagate_states_.begin();
@@ -502,6 +507,17 @@ void SuperLIO::Propagation_Undistort(){
         pt_full.x = eigen_point[0];
         pt_full.y = eigen_point[1];
         pt_full.z = eigen_point[2];
+
+        // Phase 2: body-frame point velocity for time-offset Jacobian
+        {
+          V3 p_lidar_imu = TLI_R * raw + TLI_t;
+          V3 v_inst_w = v_h + acc_t * s * dt;                        // world-frame linear velocity
+          V3 w_inst_w = w_t;                                          // world-frame angular velocity
+          V3 v_point_w = v_inst_w + w_inst_w.cross(R_i * p_lidar_imu); // point velocity (world)
+          V3 v_body = R_inv.cast<scalar>() * v_point_w.cast<scalar>(); // rotate to scan-end body frame
+          full_motion_info_[idx].query_time = query_time;
+          full_motion_info_[idx].v_body = v_body;
+        }
       }
     });
   }
@@ -517,6 +533,10 @@ void SuperLIO::Propagation_Undistort(){
     std::size_t ptsize2 = raw_pc2->points.size();
     scan_undistort_full_2_->resize(ptsize2);
 
+    // Phase 2: pre-allocate motion info for lidar1 + lidar2
+    size_t lidar1_sz = scan_undistort_full_->size();
+    full_motion_info_.resize(lidar1_sz + ptsize2);
+
     tbb::parallel_for(
     tbb::blocked_range<size_t>(0, ptsize2),
     [&](const tbb::blocked_range<size_t>& r) {
@@ -526,13 +546,15 @@ void SuperLIO::Propagation_Undistort(){
         const auto& pt = raw_pc2->points[idx];
         // intensity normalization (Mid-360 reflectivity mapped to same scale)
         pt_full.intensity = pt.intensity;
-        double query_time = start_time2 + pt.offset_time;
+        double query_time = start_time2 + pt.offset_time + kf_->getDeltaT2();
         if (query_time > propagate_states_.back().time) {
           V3 raw(pt.x, pt.y, pt.z);
           V3 eigen_point = TLI2_R * raw + TLI2_t;
           pt_full.x = eigen_point[0];
           pt_full.y = eigen_point[1];
           pt_full.z = eigen_point[2];
+          full_motion_info_[lidar1_sz + idx].query_time = query_time;
+          full_motion_info_[lidar1_sz + idx].v_body = V3::Zero();  // no valid IMU state
           continue;
         }
         auto match_iter = propagate_states_.begin();
@@ -559,6 +581,17 @@ void SuperLIO::Propagation_Undistort(){
         pt_full.x = eigen_point[0];
         pt_full.y = eigen_point[1];
         pt_full.z = eigen_point[2];
+
+        // Phase 2: body-frame point velocity for time-offset Jacobian (LiDAR2)
+        {
+          V3 p_lidar_imu = TLI2_R * raw + TLI2_t;
+          V3 v_inst_w = v_h + acc_t * s * dt;
+          V3 w_inst_w = w_t;
+          V3 v_point_w = v_inst_w + w_inst_w.cross(R_i * p_lidar_imu);
+          V3 v_body = R_inv.cast<scalar>() * v_point_w.cast<scalar>();
+          full_motion_info_[lidar1_sz + idx].query_time = query_time;
+          full_motion_info_[lidar1_sz + idx].v_body = v_body;
+        }
       }
     });
 
@@ -571,7 +604,7 @@ void SuperLIO::Propagation_Undistort(){
                 << " weight=" << g_lidar2_weight << RESET;
       merge_logged = true;
     }
-    size_t lidar1_sz = scan_undistort_full_->size();
+    lidar1_sz = scan_undistort_full_->size();
     *scan_undistort_full_ += *scan_undistort_full_2_;
     for (size_t i = lidar1_sz; i < scan_undistort_full_->size(); ++i) {
       scan_undistort_full_->points[i].intensity =
@@ -600,9 +633,9 @@ void SuperLIO::DownSample(){
 struct ThreadACC{
   M6d HTVH = M6d::Zero();
   V6d HTVr = V6d::Zero();
-  // Phase 1: calibration accumulation (21D obs: pose 6 + ext1 6 + ext2 6 + dt 3)
-  Eigen::Matrix<double, 21, 21> HTVH_calib = decltype(HTVH_calib)::Zero();
-  Eigen::Matrix<double, 21, 1>  HTVr_calib = decltype(HTVr_calib)::Zero();
+  // Phase 1: calibration accumulation (20D obs: pose 6 + ext1 6 + ext2 6 + dt 2)
+  Eigen::Matrix<double, 20, 20> HTVH_calib = decltype(HTVH_calib)::Zero();
+  Eigen::Matrix<double, 20, 1>  HTVr_calib = decltype(HTVr_calib)::Zero();
   std::vector<V3> plane_pts;
   std::vector<V3> edge_pts;
 };
@@ -654,6 +687,19 @@ void SuperLIO::Observe(){
   if (skip_observe_frames_ > 0) {
     skip_observe_frames_--;
     return;
+  }
+
+  // Phase 2: match ds points to full cloud for per-point motion info (time-offset Jacobian)
+  if (kf_->isCalibEnabled() && !full_motion_info_.empty()) {
+    pcl::KdTreeFLANN<PointType> kdtree;
+    kdtree.setInputCloud(scan_undistort_full_);
+    ds_motion_info_.resize(ptsize);
+    std::vector<int> nn_idx(1);
+    std::vector<float> nn_dist(1);
+    for (size_t i = 0; i < ptsize; ++i) {
+      kdtree.nearestKSearch(ds_undistort_->points[i], 1, nn_idx, nn_dist);
+      ds_motion_info_[i] = full_motion_info_[nn_idx[0]];
+    }
   }
 
   // Phase 1: global feature length for Jacobian normalisation.
@@ -793,17 +839,24 @@ void SuperLIO::Observe(){
                 V3d J_ext_rot  = p_raw.cross(nb_lidar) * inv_s0;  // ∂r/∂δθ = -(n×p)ᵀ = (p×n)ᵀ
                 V3d J_ext_trans = nb_lidar;
 
-                // 21D layout: pose(6), ext1(6), ext2(6), dt(3)
+                // 20D layout: pose(6), ext1(6), ext2(6), dt(2)
                 // Ext block: 6:12 for LiDAR1, 12:18 for LiDAR2
                 int ext_offset = from_lidar2 ? 12 : 6;
 
-                // Build 21D Jacobian
-                Eigen::Matrix<double, 21, 1> J_calib;
+                // Build 20D Jacobian
+                Eigen::Matrix<double, 20, 1> J_calib;
                 J_calib.setZero();
                 J_calib.segment<6>(0)  = J_pose.cast<double>();
                 J_calib.segment<3>(ext_offset)     = J_ext_rot;
                 J_calib.segment<3>(ext_offset + 3) = J_ext_trans;
-                // dt Jacobians: zero (not estimated yet)
+                // Phase 2: time-offset Jacobian (spatiotemporal calibration)
+                double J_dt = 0.0;
+                if (!ds_motion_info_.empty()) {
+                  V3d v_body = ds_motion_info_[idx].v_body.cast<double>();
+                  J_dt = normvec.dot(pose.R_.cast<double>() * v_body) * inv_s0;
+                }
+                int dt_offset = from_lidar2 ? 19 : 18;
+                J_calib(dt_offset) = J_dt;
 
                 local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
                 local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
@@ -852,11 +905,20 @@ void SuperLIO::Observe(){
                 V3d J_ext_trans = nb_lidar;
 
                 int ext_offset = from_lidar2 ? 12 : 6;
-                Eigen::Matrix<double, 21, 1> J_calib;
+                Eigen::Matrix<double, 20, 1> J_calib;
                 J_calib.setZero();
                 J_calib.segment<6>(0)  = J_pose.cast<double>();
                 J_calib.segment<3>(ext_offset)     = J_ext_rot;
                 J_calib.segment<3>(ext_offset + 3) = J_ext_trans;
+
+                // Phase 2: time-offset Jacobian (point-to-line)
+                double J_dt = 0.0;
+                if (!ds_motion_info_.empty()) {
+                  V3d v_body = ds_motion_info_[idx].v_body.cast<double>();
+                  J_dt = n_r_d.dot(pose.R_.cast<double>() * v_body) * inv_s0;
+                }
+                int dt_offset_line = from_lidar2 ? 19 : 18;
+                J_calib(dt_offset_line) = J_dt;
 
                 local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
                 local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
@@ -870,8 +932,8 @@ void SuperLIO::Observe(){
 
     M6d sum_HTVH = M6d::Zero();
     V6d sum_HTVr = V6d::Zero();
-    Eigen::Matrix<double, 21, 21> sum_HTVH_calib = decltype(sum_HTVH_calib)::Zero();
-    Eigen::Matrix<double, 21, 1>  sum_HTVr_calib = decltype(sum_HTVr_calib)::Zero();
+    Eigen::Matrix<double, 20, 20> sum_HTVH_calib = decltype(sum_HTVH_calib)::Zero();
+    Eigen::Matrix<double, 20, 1>  sum_HTVr_calib = decltype(sum_HTVr_calib)::Zero();
     static CloudPtr plane_feat(new PointCloudType());
     static CloudPtr edge_feat(new PointCloudType());
     plane_feat->clear();

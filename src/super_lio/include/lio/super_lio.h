@@ -61,6 +61,12 @@ protected:
   ROSWrapper::Ptr data_wrapper_;
   MeasureGroup measures_;
   
+  /// per-point motion info for time-offset Jacobian (Phase 2: spatiotemporal calibration)
+  struct PointMotionInfo {
+    double query_time = 0.0;      // measurement time (scan start + offset_time)
+    BASIC::V3 v_body = BASIC::V3::Zero();   // body-frame point velocity at measurement time (m/s)
+  };
+
   bool flg_init_ = false;
   bool flg_first_scan_ = true;
   std::vector<DynamicState> propagate_states_;
@@ -68,6 +74,8 @@ protected:
   BASIC::CloudPtr scan_undistort_full_2_;   // second LiDAR deskewed cloud
   BASIC::CloudPtr ds_undistort_;
   BASIC::CloudPtr point_map_, world_pc_, ds_world_;
+  std::vector<PointMotionInfo> full_motion_info_;   // parallel to scan_undistort_full_
+  std::vector<PointMotionInfo> ds_motion_info_;     // parallel to ds_undistort_
   int frame_num_ = 0;
   BASIC::SE3 sys_init_pose_;
   BASIC::SE3 last_pose_;

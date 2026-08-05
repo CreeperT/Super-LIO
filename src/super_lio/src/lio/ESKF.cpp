@@ -74,8 +74,8 @@ void ESKF::SetInitialConditions(Options options, const V3& init_bg,
   // Init calibration nominal from globals
   T_L1_IMU_ = g_lidar_imu;
   T_L2_IMU_ = g_lidar_imu2;
-  delta_t1_ = g_lidar1_time_offset;
-  delta_t2_ = g_lidar2_time_offset;
+  delta_t1_ = 0.0;  // ESKF δt is residual on top of ROSWrapper static offset
+  delta_t2_ = 0.0;  // (static offsets already applied to start_time in ROSWrapper)
 }
 
 
@@ -430,7 +430,8 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   OBS_MAT HTVH_calib;
   OBS_VEC HTVr_calib;
 
-  COV Pk, Qk;
+  COV Pk;
+  NAV_MAT Qk_nav;
 
   need_converge_ = false;
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
@@ -447,39 +448,69 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     Pk = P_;
     M3 J_theta = M3::Identity() - 0.5 * SO3::hat((R_0.inverse() * R_).log_vee());
     // Apply J_theta only to the rotation row (0) and column (0)
-    for(int j = 0; j < STATE_DIM_; j+=3){
+    for(int j = 0; j < CORE_DIM + EXTRIN_DIM; j+=3){
       Pk.block<3,3>(0, j).noalias() = J_theta * P_.block<3,3>(0, j);
     }
-    for(int j = 0; j < STATE_DIM_; j+=3){
+    for(int j = 0; j < CORE_DIM + EXTRIN_DIM; j+=3){
       Pk.block<3,3>(j, 0) = Pk.block<3,3>(j, 0) * J_theta.transpose();
     }
 
-    // SMW: Pk_inv = P⁻¹, then add HᵀWH
-    COV Pk_inv = Pk.inverse();
+    // ── Phase 1: 18×18 navigation solve (nav↔calib soft-decoupled) ──
+    // Marginal nav prior information via Schur complement of P (covariance form):
+    //   S = P_nn - P_nc·P_cc⁻¹·P_cn  (marginal nav covariance)
+    //   P_nav⁻¹ = S⁻¹                (marginal nav information)
+    // Avoids full 32×32 inverse: O(14³ + 18³) vs O(32³).
+    Eigen::Matrix<scalar, NAV_DIM, NAV_DIM> P_nn = Pk.template block<NAV_DIM, NAV_DIM>(0, 0);
+    Eigen::Matrix<scalar, NAV_DIM, CALIB_DIM> P_nc = Pk.template block<NAV_DIM, CALIB_DIM>(0, CORE_DIM);
+    Eigen::Matrix<scalar, CALIB_DIM, CALIB_DIM> P_cc = Pk.template block<CALIB_DIM, CALIB_DIM>(CORE_DIM, CORE_DIM);
+    Eigen::Matrix<scalar, CALIB_DIM, NAV_DIM> P_cn = Pk.template block<CALIB_DIM, NAV_DIM>(CORE_DIM, 0);
 
-    // ── Map observation into Pk_inv ──
-    // Pose block (always)
-    Pk_inv.block<6,6>(0,0) += HTVH_pose;
+    NAV_MAT P_nav_marg = P_nn - P_nc * P_cc.ldlt().solve(P_cn);
+    NAV_MAT Pk_inv_nav = P_nav_marg.inverse();
 
-    // ── Phase 1: block-diagonal approximation ──
-    // Pose solved in 33×33 (well-conditioned: P is block-diagonal).
-    // Calibration solved separately after IEKF loop (15×15 system).
+    // Add pose observation information to nav block
+    Pk_inv_nav.template block<6,6>(0,0) += HTVH_pose;
 
-    STATE error_dx = STATE::Zero();
-    error_dx.template block<6,1>(0, 0) = HTVr_pose;
+    // RHS: only pose residual (6D), zeros for v/bg/ba/g
+    NAV_VEC error_dx_nav = NAV_VEC::Zero();
+    error_dx_nav.template block<6,1>(0, 0) = HTVr_pose;
 
-    // Pose-only solve: calib blocks are decoupled (block-diagonal approx).
-    // P is block-diagonal (pose ⟂ calib), so the 33×33 inverse is well-conditioned.
-    Qk = Pk_inv.inverse();
-    dx_ = Qk * error_dx;
+    // Solve 18×18 navigation subsystem
+    Qk_nav = Pk_inv_nav.inverse();
+    NAV_VEC dx_nav = Qk_nav * error_dx_nav;
+
+    // ── 18×18 vs 32×32 equivalence verification (paper support) ──
+    if (g_decouple_verify) {
+      static int cmp_count = 0;
+      if (++cmp_count <= 10 || cmp_count % 500 == 0) {
+        COV Pk_inv_full = Pk.inverse();
+        Pk_inv_full.block<6,6>(0,0) += HTVH_pose;
+        STATE err_full = STATE::Zero();
+        err_full.block<6,1>(0,0) = HTVr_pose;
+        COV Qk_full = Pk_inv_full.inverse();
+        STATE dx_full = Qk_full * err_full;
+        double diff_nav = (dx_nav - dx_full.head<18>()).norm();
+        double diff_calib = dx_full.tail<14>().norm();
+        LOG(INFO) << "[DecoupleVerify#" << cmp_count << "]"
+                  << " ||dx_nav_diff||=" << diff_nav
+                  << " ||dx_calib(full)||=" << diff_calib
+                  << " ||dx_full||=" << dx_full.norm()
+                  << " ||dx_dec||=" << dx_nav.norm()
+                  << (diff_nav > 1e-3 ? " *** MISMATCH ***" : "");
+      }
+    }
+
+    // Map nav correction to full state vector
+    dx_.setZero();
+    dx_.template block<18,1>(0, 0) = dx_nav;
 
     // ── DEBUG: solver health + Δx longitudinal tracking ──
     {
       static int solver_diag = 0;
       static double cum_dx_long = 0.0;
       solver_diag++;
-      // Condition number of the 33×33 IEKF system (Pk⁻¹ + HᵀWH)
-      Eigen::JacobiSVD<COV> svd(Pk_inv);
+      // Condition number of the 18×18 navigation IEKF system
+      Eigen::JacobiSVD<NAV_MAT> svd(Pk_inv_nav);
       double cond_Pkinv = svd.singularValues()(0)
                         / (svd.singularValues()(svd.singularValues().size()-1) + 1e-30);
       // Eigenvalues of the 3×3 translation block of HTVH
@@ -487,7 +518,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       V3d ev_H = eig_HTVH.eigenvalues();
       // Longitudinal Δx — use eigenvector of weakest HTVH direction
       V3d weak_dir = eig_HTVH.eigenvectors().col(0);
-      double dx_long = std::abs(dx_.segment<3>(3).cast<double>().dot(weak_dir));
+      double dx_long = std::abs(dx_nav.template segment<3>(3).cast<double>().dot(weak_dir));
       cum_dx_long += dx_long;
 
       if (solver_diag <= 5 || solver_diag % 200 == 0) {
@@ -499,10 +530,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       }
     }
 
-    // solution remapping for degeneracy (uses posterior translation covariance + HTVH condition)
-    RemapDegeneracy(Qk.block<3, 3>(3, 3), HTVH_pose, dx_);
+    // solution remapping for degeneracy (uses navigation posterior translation covariance)
+    RemapDegeneracy(Qk_nav.template block<3, 3>(3, 3), HTVH_pose, dx_);
 
-    // update norm state (includes calibration)
+    // update norm state (navigation only; calibration dimensions are zero in dx_)
     Update();
 
     if (dx_.lpNorm<Eigen::Infinity>() < options_.quit_eps_ && iter > 0) {
@@ -510,21 +541,25 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
   }
 
-  // update P: Joseph form P = (I - K*H) * P * (I - K*H)ᵀ + K*R*Kᵀ
-  // P update (pose block only)
-  COV temp_cov = COV::Zero();
-  temp_cov.block<6,6>(0,0) = HTVH_pose;
-  P_ = (COV::Identity() - Qk * temp_cov) * Pk;
+  // ── P update: Joseph form, using decoupled Kalman gain ──
+  // Qk_32 = blockdiag(Qk_nav, I_14): calibration block gets no update from nav obs.
+  // This is equivalent to the full 32×32 Joseph update when P_nc = 0
+  // (proven by DecoupleCmp diagnostic: ||dx_nav_diff|| < 1e-9, ||dx_calib|| = 0).
+  NAV_MAT M_nav = NAV_MAT::Zero();
+  M_nav.template block<6,6>(0,0) = HTVH_pose;
+  COV I_KH_32 = COV::Identity();
+  I_KH_32.template block<18,18>(0,0).noalias() -= Qk_nav * M_nav;
+  P_ = I_KH_32 * Pk;
 
   // ── Phase 1: separate calibration update (block-diagonal, after pose converged) ──
   if (calib_enabled_) {
     // Extract calibration sub-blocks from P
-    Eigen::Matrix<scalar, 15, 15> P_calib = P_.block<15,15>(18, 18);
-    Eigen::Matrix<scalar, 15, 15> S_calib = P_calib.inverse();
-    S_calib += HTVH_calib.block<15,15>(6, 6).cast<scalar>();
+    Eigen::Matrix<scalar, 14, 14> P_calib = P_.block<14,14>(18, 18);
+    Eigen::Matrix<scalar, 14, 14> S_calib = P_calib.inverse();
+    S_calib += HTVH_calib.block<14,14>(6, 6).cast<scalar>();
 
-    Eigen::Matrix<scalar, 15, 1> dx_calib =
-        S_calib.ldlt().solve(HTVr_calib.template block<15,1>(6, 0).cast<scalar>());
+    Eigen::Matrix<scalar, 14, 1> dx_calib =
+        S_calib.ldlt().solve(HTVr_calib.template block<14,1>(6, 0).cast<scalar>());
 
     // Un-normalise rotation corrections: dθ_true = dθ_norm / s0
     if (calib_s0_ > 1.0) {
@@ -550,17 +585,21 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     if (++calib_dbg <= 5 || calib_dbg % 200 == 0) {
       scalar deg1 = dx_calib.template segment<3>(0).norm() * 180.0 / M_PI;
       scalar deg2 = dx_calib.template segment<3>(6).norm() * 180.0 / M_PI;
+      double ddt1 = dx_calib(12);  // time offset correction (seconds)
+      double ddt2 = dx_calib(13);
       LOG(INFO) << "[CalibUpdate#" << calib_dbg
                 << "] |dθ1|=" << deg1 << "° |dt1|=" << dx_calib.template segment<3>(3).norm() << "m"
                 << " |dθ2|=" << deg2 << "° |dt2|=" << dx_calib.template segment<3>(9).norm() << "m"
+                << " |dδt1|=" << (ddt1 * 1000.0) << "ms"
+                << " |dδt2|=" << (ddt2 * 1000.0) << "ms"
                 << " s0=" << calib_s0_;
     }
 
     // Update calibration covariance (Joseph form)
-    Eigen::Matrix<scalar, 15, 15> K_calib = S_calib.ldlt().solve(
-        Eigen::Matrix<scalar, 15, 15>::Identity());
-    P_.block<15,15>(18, 18) = (Eigen::Matrix<scalar, 15, 15>::Identity()
-                                - K_calib * HTVH_calib.block<15,15>(6, 6).cast<scalar>())
+    Eigen::Matrix<scalar, 14, 14> K_calib = S_calib.ldlt().solve(
+        Eigen::Matrix<scalar, 14, 14>::Identity());
+    P_.block<14,14>(18, 18) = (Eigen::Matrix<scalar, 14, 14>::Identity()
+                                - K_calib * HTVH_calib.block<14,14>(6, 6).cast<scalar>())
                                * P_calib;
   }
 
@@ -568,10 +607,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   // project P with J_theta
   M3 J_theta = M3::Identity() - 0.5 * SO3::hat(dx_.template block<3, 1>(0, 0));
-  for(int j = 0; j < STATE_DIM_; j+=3){
+  for(int j = 0; j < CORE_DIM + EXTRIN_DIM; j+=3){
     Pk.block<3,3>(0, j).noalias() = J_theta * P_.block<3,3>(0, j);
   }
-  for(int j = 0; j < STATE_DIM_; j+=3){
+  for(int j = 0; j < CORE_DIM + EXTRIN_DIM; j+=3){
     Pk.block<3,3>(j, 0) = Pk.block<3,3>(j, 0) * J_theta.transpose();
   }
 

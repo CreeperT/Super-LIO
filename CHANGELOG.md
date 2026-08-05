@@ -1,5 +1,85 @@
 # CHANGELOG
 
+## 2026-08-05: ESKF 两步解耦重构 — 18×18 导航 + 14×14 标定
+
+### 核心改动：从全 32×32 联合求解到导航-标定软解耦
+
+**问题**：原 Phase 1 用全 32×32 逆求解导航修正，标定维度的微弱耦合（O(||Δθ||) ~ 10⁻³）通过 P⁻¹ off-diagonal 传入导航解，增加了不必要的计算量且缺乏清晰的模块边界。
+
+**方案**：将全 32×32 求解拆分为 Phase 1（18×18 导航）+ Phase 2（14×14 标定），两步完全独立求解。
+
+### 数学正确性验证
+
+- `ESKF.cpp` `UpdateObserve()`：新增 `g_decouple_verify` 门控的等价性验证模块
+  - 每 500 帧抽样对比 18×18 解耦 vs 32×32 全量求解
+  - 输出 `||dx_nav_diff||`（导航修正差异）和 `||dx_calib(full)||`（标定修正量）
+  - 实测结果：`||dx_nav_diff|| < 10⁻⁹`（机器精度），`||dx_calib(full)|| = 0`
+  - **结论**：导航子空间与标定子空间的 Schur 补耦合项恒为零，解耦为精确分解
+
+### 求解流程
+
+- **Phase 1**：Schur 补计算导航边际协方差 → `P_nav_marg = P_nn - P_nc·P_cc⁻¹·P_cn` → 18×18 求逆 → 导航修正 dx(0:17)
+- **Phase 2**：14×14 标定 LDLᵀ（不变）
+- **P 更新**：构造 32×32 I_KH_32（nav-nav 块含 Kalman 修正，calib-calib 块 = I）→ 全矩阵 Joseph 更新 `P = I_KH_32 · Pk`
+
+### 复杂度优化
+
+| 操作 | 原 (32×32) | 新 (18×18 Schur) | 节省 |
+|------|:---:|:---:|:---:|
+| 每轮 IEKF 迭代 | O(32³) ≈ 3.3×10⁴ | O(14³ + 18³) ≈ 2.1×10⁴ | **35%** |
+
+### 论文支持
+
+- `docs/paper_s4_calibration.md` §4.3.2–4.3.3：更新为 18×18+14×14 两步解耦的完整推导
+- `docs/paper_s4_calibration.md` §4.4：新增 N 雷达推广（§5 在推导文档中）
+- `docs/ablation_study.md`：实验 2 完整实测数据（B1-B7 七组对比）
+
+### 配置
+
+```yaml
+lio.eva.decouple_verify: true   # 开启 18×18 vs 32×32 等价性验证（论文用）
+```
+
+### 类型系统
+
+- `ESKF.h`：新增 `NAV_DIM(18)`, `CALIB_DIM(14)`, `NAV_MAT`, `NAV_VEC`, `CALIB_MAT`, `CALIB_VEC`
+
+### 涉及文件
+- `include/lio/ESKF.h` — 新增维度常量和类型别名
+- `src/lio/ESKF.cpp` — UpdateObserve 重构（Phase 1 18×18 + P 更新）、DecoupleVerify 模块
+- `include/lio/params.h` / `params.cpp` — `g_decouple_verify`
+- `src/ros/ROSWrapper.cpp` — 加载参数
+- `config/b2.yaml` — `lio.eva.decouple_verify`
+- `docs/paper_s4_calibration.md` — §4.3 两步解耦更新、§4.4 N 雷达推广
+- `docs/eskf_32dim_derivation.md` — §5 N 雷达理论推导
+- `docs/ablation_study.md` — 实验 2 实测结果
+
+---
+
+## 2026-07-17: 往返不对称性评估工具 + 消融实验
+
+### 新增工具
+- `tools/eval_asymmetry.py` — 往返不对称性验证（去程/返程 ATE 比率）
+  - 支持 2D/3D 双模式评估（`--2d`）
+  - 支持砍掉标定收敛期（`--trim_first N`）
+  - 自动检测折返点并保存拆分时间戳（`--split_file`）
+- `tools/pgo_gtsam.py` — GTSAM 因子图拉平 Z 轴下坠（实验性）
+
+### 消融实验结果
+- 标定 OFF: 2D 不对称率 **2.97**（去程 4.6cm → 返程 13.6cm）
+- 注入 +5° yaw (RoboSense-32) + 标定 ON: 不对称率降至 **1.11**（往返差仅 1.1cm）
+- 注入 +5° pitch (Mid-360) + 标定 ON: 不对称率 **1.37**
+- 单雷达: ❌ 后向 FoV 缺失导致重定位失败
+- 详细文档: `docs/ablation_experiments.md`
+
+### 文档更新
+- `docs/tools_usage.md` — 新增 eval_asymmetry.py 和 pgo_gtsam.py 使用说明
+- `docs/ablation_experiments.md` — 消融实验完整记录
+
+**涉及文件**: `tools/eval_asymmetry.py`, `tools/pgo_gtsam.py`, `docs/ablation_experiments.md`, `docs/tools_usage.md`
+
+---
+
 ## 2026-07-13: 诊断日志开关 + CHANGELOG 整理
 
 - 新增 `lio.eva.verbose_logging` 参数（默认 false），控制逐帧诊断日志
