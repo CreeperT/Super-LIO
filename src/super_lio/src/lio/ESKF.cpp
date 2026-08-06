@@ -541,15 +541,21 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
   }
 
-  // ── P update: standard form P = (I - KH) * P_prior, using decoupled Kalman gain ──
-  // Qk_32 = blockdiag(Qk_nav, I_14): calibration block gets no update from nav obs.
-  // This is equivalent to the full 32×32 standard update when P_nc = 0
-  // (proven by DecoupleCmp diagnostic: ||dx_nav_diff|| < 1e-9, ||dx_calib|| = 0).
+  // ── P update: nav block via information form (SPD guaranteed), cross via standard form ──
+  // Information form: P_nav_post = (P_nav_prior⁻¹ + HᵀWH)⁻¹ = Qk_nav  — strictly SPD.
+  // Cross-covariance: standard form propagation (always zero since P_nc ≡ 0, but
+  // structurally correct for the general case).
+  P_.template block<18,18>(0,0) = Qk_nav;
+
   NAV_MAT M_nav = NAV_MAT::Zero();
   M_nav.template block<6,6>(0,0) = HTVH_pose;
-  COV I_KH_32 = COV::Identity();
-  I_KH_32.template block<18,18>(0,0).noalias() -= Qk_nav * M_nav;
-  P_ = I_KH_32 * Pk;
+  NAV_MAT I_KH_nav = NAV_MAT::Identity() - Qk_nav * M_nav;
+  P_.template block<18,14>(0,18).noalias() =
+      I_KH_nav * Pk.template block<18,14>(0,18);
+  P_.template block<14,18>(18,0) =
+      P_.template block<18,14>(0,18).transpose();
+
+  // Calibration block P_(18:31,18:31) unchanged — updated in Phase 2
 
   // ── Phase 1: separate calibration update (block-diagonal, after pose converged) ──
   if (calib_enabled_) {
