@@ -541,9 +541,9 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     }
   }
 
-  // ── P update: Joseph form, using decoupled Kalman gain ──
+  // ── P update: standard form P = (I - KH) * P_prior, using decoupled Kalman gain ──
   // Qk_32 = blockdiag(Qk_nav, I_14): calibration block gets no update from nav obs.
-  // This is equivalent to the full 32×32 Joseph update when P_nc = 0
+  // This is equivalent to the full 32×32 standard update when P_nc = 0
   // (proven by DecoupleCmp diagnostic: ||dx_nav_diff|| < 1e-9, ||dx_calib|| = 0).
   NAV_MAT M_nav = NAV_MAT::Zero();
   M_nav.template block<6,6>(0,0) = HTVH_pose;
@@ -595,7 +595,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
                 << " s0=" << calib_s0_;
     }
 
-    // Update calibration covariance (Joseph form)
+    // Update calibration covariance (standard form)
     Eigen::Matrix<scalar, 14, 14> K_calib = S_calib.ldlt().solve(
         Eigen::Matrix<scalar, 14, 14>::Identity());
     P_.block<14,14>(18, 18) = (Eigen::Matrix<scalar, 14, 14>::Identity()
