@@ -1,5 +1,6 @@
 #include "lio/ESKF.h"
 #include "basic/logs.h"
+#include <fstream>
 
 using namespace BASIC;
 
@@ -482,15 +483,17 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     // ── 18×18 vs 32×32 equivalence verification (paper support) ──
     if (g_decouple_verify) {
       static int cmp_count = 0;
-      if (++cmp_count <= 10 || cmp_count % 500 == 0) {
-        COV Pk_inv_full = Pk.inverse();
-        Pk_inv_full.block<6,6>(0,0) += HTVH_pose;
-        STATE err_full = STATE::Zero();
-        err_full.block<6,1>(0,0) = HTVr_pose;
-        COV Qk_full = Pk_inv_full.inverse();
-        STATE dx_full = Qk_full * err_full;
-        double diff_nav = (dx_nav - dx_full.head<18>()).norm();
-        double diff_calib = dx_full.tail<14>().norm();
+      ++cmp_count;
+      // Full 32×32 solve, computed every frame (per-frame CSV for the paper figure)
+      COV Pk_inv_full = Pk.inverse();
+      Pk_inv_full.block<6,6>(0,0) += HTVH_pose;
+      STATE err_full = STATE::Zero();
+      err_full.block<6,1>(0,0) = HTVr_pose;
+      COV Qk_full = Pk_inv_full.inverse();
+      STATE dx_full = Qk_full * err_full;
+      double diff_nav = (dx_nav - dx_full.head<18>()).norm();
+      double diff_calib = dx_full.tail<14>().norm();
+      if (cmp_count <= 10 || cmp_count % 500 == 0) {
         LOG(INFO) << "[DecoupleVerify#" << cmp_count << "]"
                   << " ||dx_nav_diff||=" << diff_nav
                   << " ||dx_calib(full)||=" << diff_calib
@@ -498,6 +501,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
                   << " ||dx_dec||=" << dx_nav.norm()
                   << (diff_nav > 1e-3 ? " *** MISMATCH ***" : "");
       }
+      // Paper figure: per-frame CSV (frame, diff_nav, diff_calib, ||dx_full||, ||dx_dec||)
+      static std::ofstream dv("/home/creepert/Super-LIO/src/super_lio/logs/decouple_verify.csv", std::ios::app);
+      dv << cmp_count << "," << diff_nav << "," << diff_calib
+         << "," << dx_full.norm() << "," << dx_nav.norm() << "\n";
     }
 
     // Map nav correction to full state vector
