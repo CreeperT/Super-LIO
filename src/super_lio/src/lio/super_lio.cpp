@@ -2,6 +2,7 @@
 #include "lio/super_lio.h"
 
 #include <sys/resource.h>
+#include <fstream>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_vector.h>
@@ -636,6 +637,9 @@ struct ThreadACC{
   // Phase 1: calibration accumulation (20D obs: pose 6 + ext1 6 + ext2 6 + dt 2)
   Eigen::Matrix<double, 20, 20> HTVH_calib = decltype(HTVH_calib)::Zero();
   Eigen::Matrix<double, 20, 1>  HTVr_calib = decltype(HTVr_calib)::Zero();
+  // §3 Eq. paper: pose↔extrinsic coupling ΔC_k = Σ w·J_pose·J_ext,kᵀ (6×6)
+  M6d DC1 = M6d::Zero();
+  M6d DC2 = M6d::Zero();
   std::vector<V3> plane_pts;
   std::vector<V3> edge_pts;
 };
@@ -839,6 +843,16 @@ void SuperLIO::Observe(){
                 V3d J_ext_rot  = p_raw.cross(nb_lidar) * inv_s0;  // ∂r/∂δθ = -(n×p)ᵀ = (p×n)ᵀ
                 V3d J_ext_trans = nb_lidar;
 
+                // ΔC_k accumulation: pose↔extrinsic coupling (paper §3)
+                V6d J_ext_full;
+                J_ext_full.head<3>() = J_ext_rot;
+                J_ext_full.tail<3>() = J_ext_trans;
+                if (from_lidar2) {
+                  local_acc.DC2.noalias() += J_pose * (w * J_ext_full.transpose());
+                } else {
+                  local_acc.DC1.noalias() += J_pose * (w * J_ext_full.transpose());
+                }
+
                 // 20D layout: pose(6), ext1(6), ext2(6), dt(2)
                 // Ext block: 6:12 for LiDAR1, 12:18 for LiDAR2
                 int ext_offset = from_lidar2 ? 12 : 6;
@@ -904,6 +918,16 @@ void SuperLIO::Observe(){
                 V3d J_ext_rot  = nb_lidar.cross(p_raw) * inv_s0;
                 V3d J_ext_trans = nb_lidar;
 
+                // ΔC_k accumulation: pose↔extrinsic coupling (paper §3)
+                V6d J_ext_full;
+                J_ext_full.head<3>() = J_ext_rot;
+                J_ext_full.tail<3>() = J_ext_trans;
+                if (from_lidar2) {
+                  local_acc.DC2.noalias() += J_pose * (w * J_ext_full.transpose());
+                } else {
+                  local_acc.DC1.noalias() += J_pose * (w * J_ext_full.transpose());
+                }
+
                 int ext_offset = from_lidar2 ? 12 : 6;
                 Eigen::Matrix<double, 20, 1> J_calib;
                 J_calib.setZero();
@@ -932,6 +956,8 @@ void SuperLIO::Observe(){
 
     M6d sum_HTVH = M6d::Zero();
     V6d sum_HTVr = V6d::Zero();
+    M6d sum_DC1 = M6d::Zero();
+    M6d sum_DC2 = M6d::Zero();
     Eigen::Matrix<double, 20, 20> sum_HTVH_calib = decltype(sum_HTVH_calib)::Zero();
     Eigen::Matrix<double, 20, 1>  sum_HTVr_calib = decltype(sum_HTVr_calib)::Zero();
     static CloudPtr plane_feat(new PointCloudType());
@@ -941,6 +967,8 @@ void SuperLIO::Observe(){
     for(const auto& local_acc : tls_acc){
       sum_HTVH += local_acc.HTVH;
       sum_HTVr += local_acc.HTVr;
+      sum_DC1 += local_acc.DC1;
+      sum_DC2 += local_acc.DC2;
       sum_HTVH_calib += local_acc.HTVH_calib;
       sum_HTVr_calib += local_acc.HTVr_calib;
       for (auto& p : local_acc.plane_pts) {
@@ -956,6 +984,21 @@ void SuperLIO::Observe(){
     HTVr_pose = sum_HTVr.cast<scalar>();
     HTVH_calib = sum_HTVH_calib.cast<scalar>();
     HTVr_calib = sum_HTVr_calib.cast<scalar>();
+
+    // ── Paper §3: per-frame H_pose + ΔC dump for Eq.(20) prediction validation ──
+    // Columns: frame, H_pose(36), ΔC1(36), ΔC2(36) — row-major. Once per frame (iter 0).
+    if (g_decouple_verify && iter_num == 0) {
+      static std::ofstream pdc("/home/creepert/Super-LIO/src/super_lio/logs/pose_dc.csv",
+                               std::ios::app);
+      pdc << frame_num_;
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc << "," << sum_HTVH(r, c);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc << "," << sum_DC1(r, c);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc << "," << sum_DC2(r, c);
+      pdc << "\n";
+    }
 
     // publish feature points for visualization
     if (!plane_feat->empty())
