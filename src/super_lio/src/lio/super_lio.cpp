@@ -15,6 +15,11 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+// Displacement the platform must cover before the route direction is latched (manual
+// grade reference). Large enough that no stationary jitter can reach it, small enough
+// that the first straight stretch defines the direction.
+static constexpr double kRouteLatchDist = 3.0;
+
 inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
 {
   Eigen::Vector3d normvec;
@@ -173,19 +178,61 @@ void SuperLIO::process(){
 
 
 bool SuperLIO::kf_init(){
-  static int imu_cout = 0;
+  // Stationarity test for gravity / accelerometer-bias initialisation — the same
+  // criterion as the relocalisation path (super_lio_reloc.cpp, "Fix 1").
+  // Averaging motion samples biases the gravity direction; the resulting vertical
+  // specific-force error is unobservable in SLAM (the map is built from the
+  // estimate itself) and integrates into a severe z sag.
+  constexpr double kStaticAccTol = 1.5;    // | ‖a‖ − g |  [m/s²]
+  constexpr double kStaticGyrTol = 0.15;   // ‖ω‖          [rad/s]
+  constexpr int    kMinStatic    = 100;    // stationary samples required
+  constexpr int    kMaxTotal     = 400;    // hard deadline: init must never hang
+
+  static int static_cout = 0;              // samples that passed the stationary test
+  static int total_cout  = 0;              // every sample seen (deadline + fallback)
   static V3 mean_gyro = V3::Zero();
   static V3 mean_acce = V3::Zero();
+  static V3 raw_mean_gyro = V3::Zero();
+  static V3 raw_mean_acce = V3::Zero();
 
   for(auto& imu: measures_.imu){
-    imu_cout ++;
-    mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
-    mean_acce += (imu.acc - mean_acce) / imu_cout;
+    total_cout++;
+    raw_mean_gyro += (imu.gyr - raw_mean_gyro) / total_cout;
+    raw_mean_acce += (imu.acc - raw_mean_acce) / total_cout;
+
+    if(std::abs(imu.acc.norm() - g_gravity_norm) < kStaticAccTol &&
+       imu.gyr.norm() < kStaticGyrTol){
+      static_cout++;
+      mean_gyro += (imu.gyr - mean_gyro) / static_cout;
+      mean_acce += (imu.acc - mean_acce) / static_cout;
+    }
   }
 
-  /// 100 Hz for 1 second.
-  if(imu_cout < 50){
-    return false;
+  if(static_cout < kMinStatic){
+    if(total_cout < kMaxTotal){
+      return false;
+    }
+    // Deadline reached: proceed rather than hang, but report the shortfall.
+    if(static_cout > 0){
+      LOG(WARNING) << YELLOW
+                   << " ---> [SuperLIO] Only " << static_cout << "/" << kMinStatic
+                   << " stationary IMU samples (" << total_cout << " total) — gravity/bias"
+                   << " init is unreliable. Keep the platform still at startup!" << RESET;
+    }else{
+      LOG(WARNING) << YELLOW
+                   << " ---> [SuperLIO] No stationary IMU sample in " << total_cout
+                   << " samples — falling back to the raw mean. Gravity/bias init is"
+                   << " unreliable. Keep the platform still at startup!" << RESET;
+      mean_gyro = raw_mean_gyro;
+      mean_acce = raw_mean_acce;
+    }
+  }else{
+    LOG(INFO) << GREEN << " ---> [SuperLIO] Gravity init from " << static_cout
+              << "/" << total_cout << " stationary IMU samples." << RESET;
+  }
+
+  if(mean_acce.norm() < 1e-3){
+    return false;   // nothing usable yet, keep accumulating
   }
 
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
@@ -210,11 +257,14 @@ bool SuperLIO::kf_init(){
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
 
-  // Estimate accelerometer bias from stationary init data.
-  // At rest: measured = -gravity_imu + bias.  mean_acce ≈ -gravity_imu + bias.
-  // Expected static acc = mean_acce.normalized() * g ≈ -gravity_imu (unbiased).
-  // Therefore bias ≈ mean_acce - expected = mean_acce * (1 - g/|mean|).
-  V3 estimated_ba = mean_acce * (1.0f - imu_scale);
+  // The ESKF applies the measurement as  acc = imu_scale * acc_raw - ba  (ESKF.cpp,
+  // Predict / Propagation_Undistort).  imu_scale = g / ‖ā‖ already normalises the
+  // static magnitude to g, i.e. it absorbs the radial part of the accelerometer
+  // bias.  Subtracting mean_acce * (1 - imu_scale) on top of that double-counts the
+  // bias and leaves the propagated specific force with a residual of exactly -ba —
+  // a constant vertical error that is unobservable in SLAM and integrates into the
+  // z sag.  The bias actually consistent with the scaled measurement is this residual.
+  V3 estimated_ba = imu_scale * mean_acce - mean_acce.normalized() * g_gravity_norm;
 
   kf_->SetInitialConditions(options, mean_gyro, estimated_ba, imu_scale, ref_gravity);
   auto state = kf_->GetSysState();
@@ -447,6 +497,11 @@ void SuperLIO::Propagation_Undistort(){
     kf_->Predict(imu);
     propagate_states_.emplace_back(kf_->GetDynamicState());
   }
+  // per-frame reset of the deskew-fallback accounting (reported next to [FeatDiag])
+  stale_n1_.store(0, std::memory_order_relaxed);
+  stale_n2_.store(0, std::memory_order_relaxed);
+  stale_dt1_.store(0, std::memory_order_relaxed);
+  stale_dt2_.store(0, std::memory_order_relaxed);
 
   const SE3 T_end = kf_->GetSE3();
   const M3  R_inv = T_end.R_.transpose();
@@ -482,6 +537,9 @@ void SuperLIO::Propagation_Undistort(){
           pt_full.z = eigen_point[2];
           full_motion_info_[idx].query_time = query_time;
           full_motion_info_[idx].v_body = V3::Zero();
+          stale_n1_.fetch_add(1, std::memory_order_relaxed);
+          stale_dt1_.fetch_add(static_cast<long>((query_time - propagate_states_.back().time) * 1e6),
+                               std::memory_order_relaxed);
           continue;
         }
         auto match_iter = propagate_states_.begin();
@@ -556,6 +614,9 @@ void SuperLIO::Propagation_Undistort(){
           pt_full.z = eigen_point[2];
           full_motion_info_[lidar1_sz + idx].query_time = query_time;
           full_motion_info_[lidar1_sz + idx].v_body = V3::Zero();  // no valid IMU state
+          stale_n2_.fetch_add(1, std::memory_order_relaxed);
+          stale_dt2_.fetch_add(static_cast<long>((query_time - propagate_states_.back().time) * 1e6),
+                               std::memory_order_relaxed);
           continue;
         }
         auto match_iter = propagate_states_.begin();
@@ -642,7 +703,76 @@ struct ThreadACC{
   M6d DC2 = M6d::Zero();
   std::vector<V3> plane_pts;
   std::vector<V3> edge_pts;
+  // ── Structural-regularity diagnostics (per frame, iteration 0 only) ──
+  // "The constraint had no effect" and "the constraint never bit" are
+  // indistinguishable without these: n_* prove planes were actually snapped, and
+  // sum_dtheta_* say how many degrees the snap was trying to correct.
+  int    n_snap_wall = 0;
+  double sum_dtheta_wall = 0.0;     // radians
+  // Raw plane-fit outcome and classification, before any snapping. Tells apart
+  // "no ground plane is ever fitted" from "ground planes exist but are not snapped".
+  int    n_fit_ok = 0;
+  int    n_fit_fail = 0;
+  int    n_cls_ground = 0;
+  int    n_cls_wall = 0;
+  int    n_cls_mid = 0;
 };
+
+
+// Robust plane fit of the ground from the CURRENT scan, in the body (IMU) frame.
+// The map's own ground planes are unusable for the structural prior: they were built
+// by the drifting estimate, so they carry the very tilt we want to measure, and
+// re-orienting them while keeping the plane through the same map points leaves the
+// residual (and hence the attitude leverage) almost unchanged. Fitting the scan
+// directly gives an observation of the terrain that is independent of the map.
+bool SuperLIO::fit_scan_ground(V3& n_body, int& n_inliers) const {
+  n_inliers = 0;
+  if (!ds_undistort_) return false;
+  const std::size_t n = ds_undistort_->size();
+  if (n < 200) return false;
+
+  static std::vector<V3d> pts;   // static: avoids a per-frame allocation
+  pts.clear();
+  pts.reserve(n / 4);
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto& p = ds_undistort_->points[i];
+    if (p.z < -0.2f && p.z > -3.0f)   // below the sensor, i.e. the ground band
+      pts.emplace_back(static_cast<double>(p.x), static_cast<double>(p.y),
+                       static_cast<double>(p.z));
+  }
+  if (pts.size() < 100) return false;
+
+  V3d nrm(0.0, 0.0, 1.0);
+  std::vector<char> keep(pts.size(), 1);
+  V3d c = V3d::Zero();
+  for (int it = 0; it < 3; ++it) {
+    c.setZero();
+    int m = 0;
+    for (std::size_t i = 0; i < pts.size(); ++i)
+      if (keep[i]) { c += pts[i]; ++m; }
+    if (m < 50) return false;
+    c /= static_cast<double>(m);
+    M3d C = M3d::Zero();
+    for (std::size_t i = 0; i < pts.size(); ++i)
+      if (keep[i]) { const V3d d = pts[i] - c; C.noalias() += d * d.transpose(); }
+    Eigen::SelfAdjointEigenSolver<M3d> es(C);
+    nrm = es.eigenvectors().col(0);
+    if (nrm.z() < 0.0) nrm = -nrm;
+    int kept = 0;
+    for (std::size_t i = 0; i < pts.size(); ++i) {
+      const bool in = std::abs((pts[i] - c).dot(nrm)) < 0.15;
+      keep[i] = in ? 1 : 0;
+      kept += in ? 1 : 0;
+    }
+    n_inliers = kept;
+  }
+  // A ground plane must be roughly horizontal in the body frame; reject anything
+  // else (e.g. a wall face caught by the z-band) so a bogus reference never reaches
+  // the pitch channel.
+  if (nrm.z() < 0.7) return false;
+  n_body = nrm.cast<scalar>();
+  return n_inliers >= 100;
+}
 
 
 void SuperLIO::Observe(){
@@ -723,6 +853,78 @@ void SuperLIO::Observe(){
 
   ivox_->reset_max_group();
   int iter_num = 0;
+
+  // ── Horizontal direction of travel (world frame), for the structural ground prior ──
+  // The terrain's grade is only defined relative to the direction of travel: the
+  // ground channel removes the component of the floor normal along this direction
+  // (the longitudinal grade) and leaves the cross-slope alone. Direction is taken
+  // from the ESKF velocity and latched, because it is ill-defined at low speed.
+  {
+    const V3 vel = kf_->GetNavState().v;
+    const double v_h = std::hypot(vel.x(), vel.y());
+    if (v_h > 0.15) {
+      travel_dir_w_ = V3(vel.x() / v_h, vel.y() / v_h, 0.0);
+      travel_dir_valid_ = true;
+    }
+  }
+  const bool have_travel_dir = travel_dir_valid_;
+  const V3d t_w = travel_dir_w_.cast<double>();
+  const V3d p_w(-t_w.y(), t_w.x(), 0.0);   // horizontal perpendicular
+  // Reference longitudinal grade (tan of the angle). Captured terrain normal wins;
+  // otherwise fall back to the configured site parameter.
+  double grade_ref = std::tan(g_structure_ground_grade_deg * M_PI / 180.0);
+  if (ground_ref_done_ && ground_ref_count_ > 0) {
+    V3d g_ref = ground_ref_w_.cast<double>();
+    if (g_ref[2] < 0) g_ref = -g_ref;
+    if (g_ref[2] > 1e-3) grade_ref = -(g_ref.dot(t_w)) / g_ref[2];
+  } else if (have_travel_dir) {
+    // Manual reference: the configured scalar is defined along the ROUTE direction, so it
+    // flips with the direction of travel just as the projected captured normal does.
+    // Without the flip the residual r = s − grade_ref (s = longitudinal grade along the
+    // CURRENT direction of travel) demands the same signed slope after a 180° turn, i.e. a
+    // climb in both directions: on 5#GJD (377 m out, 0.566°) that biased the return leg by
+    // 2×0.566° and the terminal z by ~7 m, while the out leg matched the truth to 0.02°.
+    // The route direction comes from the DISPLACEMENT once it exceeds kRouteLatchDist —
+    // latching the instantaneous velocity instead mis-signs the WHOLE run when the first
+    // frames past init jitter over the 0.15 m/s gate (measured: z profile mirrored).
+    const V3d p_now = kf_->GetNavState().p.cast<double>();
+    if (!travel_dir0_valid_) {
+      if (!travel_dir0_pending_) {
+        travel_dir0_p0_ = kf_->GetNavState().p;
+        travel_dir0_pending_ = true;
+      }
+      const V3d d = p_now - travel_dir0_p0_.cast<double>();
+      const double dn = std::hypot(d.x(), d.y());
+      if (dn > kRouteLatchDist) {
+        travel_dir0_w_ = V3(d.x() / dn, d.y() / dn, 0.0);
+        travel_dir0_valid_ = true;
+        LOG(INFO) << GREEN << " ---> [Structure] Route direction latched from " << dn
+                  << " m of travel; manual grade reference flips at the turn-around."
+                  << RESET;
+      }
+    }
+    if (travel_dir0_valid_ && t_w.dot(travel_dir0_w_.cast<double>()) < 0.0) {
+      grade_ref = -grade_ref;
+    }
+  }
+  const bool have_grade_ref = have_travel_dir && (ground_ref_done_ || !g_structure_ground_grade_auto);
+
+  // Fit the ground from the CURRENT scan (body frame) for the pitch channel. Done
+  // once per frame, outside the IEKF loop: it depends only on the scan, not on the
+  // pose, so it is a genuine map-independent observation of the terrain.
+  scan_ground_valid_ = g_structure_ground_enabled &&
+                       fit_scan_ground(scan_ground_n_b_, scan_ground_inliers_);
+  double grade_resid_tan = 0.0;   // diagnostics: tan(grade error) fed to the filter
+
+  // One-shot confirmation that the ground channel actually engages (it stays silent
+  // until the direction of travel is known, i.e. until the platform starts moving).
+  static bool grade_logged = false;
+  if (g_structure_ground_enabled && have_grade_ref && !grade_logged) {
+    LOG(INFO) << GREEN << " ---> [Structure] Ground channel active: reference"
+              << " longitudinal grade = " << std::atan(grade_ref) * 180.0 / M_PI
+              << " deg; cross-slope preserved, roll untouched." << RESET;
+    grade_logged = true;
+  }
 
   kf_->UpdateObserve([&, this, s0](const ESKF::KFState &kf_state,
                                      M6 &HTVH_pose, V6 &HTVr_pose,
@@ -807,6 +1009,53 @@ void SuperLIO::Observe(){
                 edge_mask_[idx] = false;
               }
             }
+
+            // ── Plane-fit outcome + raw classification (iteration 0 only) ──
+            // Counted BEFORE any snapping, so |n_z| is the map plane's own tilt.
+            if (iter_num == 0) {
+              const double _lim = g_structure_max_angle_deg * M_PI / 180.0;
+              if (effect_mask_[idx]) {
+                local_acc.n_fit_ok++;
+                const double az = std::abs(abcd_vec_[idx][2]);
+                if (az > std::cos(_lim))      local_acc.n_cls_ground++;
+                else if (az < std::sin(_lim)) local_acc.n_cls_wall++;
+                else                          local_acc.n_cls_mid++;
+              } else {
+                local_acc.n_fit_fail++;
+              }
+            }
+
+            // ── Wall channel: vertical planes constrain ROLL (yaw left free) ──
+            // The ground channel deliberately does NOT use this mechanism. A map plane
+            // whose normal is re-oriented but which still passes through the same map
+            // points yields a residual of only |p_w − c|·sin(dtheta) — measured at
+            // 0.17 m × sin(8.4°) = 0.024 m, i.e. ~0.14° of attitude leverage over a
+            // 10 m lever arm. That was measured to be a near no-op, so the pitch
+            // channel is a dedicated scan-based residual instead (added after the pose
+            // block is accumulated, below).
+            if (g_structure_wall_enabled && effect_mask_[idx]) {
+              auto& abcd = abcd_vec_[idx];
+              const double lim = g_structure_max_angle_deg * M_PI / 180.0;
+              if (std::abs(abcd[2]) < std::sin(lim)) {
+                const V3d n_orig(abcd[0], abcd[1], abcd[2]);
+                const double h = std::hypot(abcd[0], abcd[1]);
+                const V3d n_reg(abcd[0] / h, abcd[1] / h, 0.0);
+                // Keep the plane through the same inlier centroid: only the
+                // orientation is regularised, not the surface position.
+                V3d c = V3d::Zero();
+                for (int j = 0; j < top_K.count; ++j) c += top_K.points_[j].cast<double>();
+                c /= static_cast<double>(top_K.count);
+                abcd[0] = n_reg[0];
+                abcd[1] = n_reg[1];
+                abcd[2] = n_reg[2];
+                abcd[3] = -n_reg.dot(c);
+                if (iter_num == 0) {
+                  local_acc.n_snap_wall++;
+                  local_acc.sum_dtheta_wall +=
+                      std::acos(std::min(1.0, std::abs(n_orig.dot(n_reg))));
+                }
+              }
+            }
           }
 
           if(!effect_mask_[idx] && !edge_mask_[idx]) continue;
@@ -874,6 +1123,22 @@ void SuperLIO::Observe(){
 
                 local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
                 local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
+              } else if (g_pose_dc_dump) {
+                // ΔC 仅在导出打开、且在线标定关闭时补算：位姿-外参耦合是纯几何量，
+                // 不依赖标定状态是否在线估计（关标定对照组同样需要 ΔC 做式(20) 验证）。
+                bool from_lidar2 = _is_lidar2[idx];
+                const M3d& R_ext_T = from_lidar2 ? R_ext2_T : R_ext1_T;
+                const V3d& t_ext = from_lidar2 ? t_ext2 : t_ext1;
+                V3d p_raw = R_ext_T * (point_body_d - t_ext);
+                V3d nb_lidar = R_ext_T * nb;
+                V6d J_ext_full;
+                J_ext_full.head<3>() = p_raw.cross(nb_lidar) * inv_s0;
+                J_ext_full.tail<3>() = nb_lidar;
+                if (from_lidar2) {
+                  local_acc.DC2.noalias() += J_pose * (w * J_ext_full.transpose());
+                } else {
+                  local_acc.DC1.noalias() += J_pose * (w * J_ext_full.transpose());
+                }
               }
             }
           }
@@ -946,6 +1211,21 @@ void SuperLIO::Observe(){
 
                 local_acc.HTVH_calib += J_calib * w * J_calib.transpose();
                 local_acc.HTVr_calib -= J_calib * w * static_cast<double>(error);
+              } else if (g_pose_dc_dump) {
+                // 同平面分支：在线标定关闭时补算 ΔC（点-线残差沿用本分支的叉积次序）。
+                bool from_lidar2 = _is_lidar2[idx];
+                const M3d& R_ext_T = from_lidar2 ? R_ext2_T : R_ext1_T;
+                const V3d& t_ext = from_lidar2 ? t_ext2 : t_ext1;
+                V3d p_raw = R_ext_T * (point_body_d - t_ext);
+                V3d nb_lidar = R_ext_T * nb;
+                V6d J_ext_full;
+                J_ext_full.head<3>() = nb_lidar.cross(p_raw) * inv_s0;
+                J_ext_full.tail<3>() = nb_lidar;
+                if (from_lidar2) {
+                  local_acc.DC2.noalias() += J_pose * (w * J_ext_full.transpose());
+                } else {
+                  local_acc.DC1.noalias() += J_pose * (w * J_ext_full.transpose());
+                }
               }
             } else {
               edge_mask_[idx] = false;
@@ -954,12 +1234,60 @@ void SuperLIO::Observe(){
         }
     });
 
+    // ── Capture the terrain normal during the initial stationary segment ──
+    // The ground is NOT necessarily horizontal, so we must not assume it is: we
+    // record the terrain's own normal once, while the gravity-aligned initialisation
+    // is still trustworthy, and only ever enforce its component along the direction
+    // of travel (the longitudinal grade) afterwards. Taken from the map planes that
+    // were just fitted, so it costs nothing extra. Never blocks: if the platform is
+    // already moving, or no ground plane is seen, it gives up and falls back to the
+    // configured lio.structure.ground_grade_deg.
+    if (g_structure_ground_enabled && g_structure_ground_grade_auto && !ground_ref_done_) {
+      const V3 vel = kf_->GetNavState().v;
+      const bool still = (std::hypot(vel.x(), vel.y()) < 0.10);
+      ground_ref_frames_++;
+      if (still) {
+        const double cos_lim = std::cos(g_structure_max_angle_deg * M_PI / 180.0);
+        for (size_t k = 0; k < effect_knn_num_; ++k) {
+          const int idx = effect_knn_idxs_[k];
+          if (!effect_mask_[idx]) continue;
+          const auto& a = abcd_vec_[idx];
+          if (std::abs(a[2]) < cos_lim) continue;   // ground / ceiling only
+          V3d n(a[0], a[1], a[2]);
+          if (n[2] < 0.0) n = -n;
+          ground_ref_w_ += (n.cast<scalar>() - ground_ref_w_) /
+                           static_cast<scalar>(ground_ref_count_ + 1);
+          ground_ref_count_++;
+        }
+      }
+      if (ground_ref_count_ >= 2000 || ground_ref_frames_ >= 40) {
+        if (ground_ref_count_ > 0) {
+          ground_ref_w_.normalize();
+          const double tilt = std::acos(std::min(
+              1.0, static_cast<double>(ground_ref_w_.z()))) * 180.0 / M_PI;
+          LOG(INFO) << GREEN << " ---> [Structure] Terrain normal captured from "
+                    << ground_ref_count_ << " plane samples over " << ground_ref_frames_
+                    << " frames: tilt from vertical = " << tilt
+                    << " deg. Only the longitudinal grade is held to this reference;"
+                    << " the cross-slope is left untouched." << RESET;
+        } else {
+          LOG(WARNING) << YELLOW << " ---> [Structure] No ground plane seen during the"
+                       << " initial stationary segment — falling back to"
+                       << " lio.structure.ground_grade_deg." << RESET;
+        }
+        ground_ref_done_ = true;
+      }
+    }
+
     M6d sum_HTVH = M6d::Zero();
     V6d sum_HTVr = V6d::Zero();
     M6d sum_DC1 = M6d::Zero();
     M6d sum_DC2 = M6d::Zero();
     Eigen::Matrix<double, 20, 20> sum_HTVH_calib = decltype(sum_HTVH_calib)::Zero();
     Eigen::Matrix<double, 20, 1>  sum_HTVr_calib = decltype(sum_HTVr_calib)::Zero();
+    int    n_snap_wall = 0;
+    double sum_dtheta_wall = 0.0;
+    int    n_fit_ok = 0, n_fit_fail = 0, n_cls_ground = 0, n_cls_wall = 0, n_cls_mid = 0;
     static CloudPtr plane_feat(new PointCloudType());
     static CloudPtr edge_feat(new PointCloudType());
     plane_feat->clear();
@@ -971,6 +1299,13 @@ void SuperLIO::Observe(){
       sum_DC2 += local_acc.DC2;
       sum_HTVH_calib += local_acc.HTVH_calib;
       sum_HTVr_calib += local_acc.HTVr_calib;
+      n_snap_wall += local_acc.n_snap_wall;
+      sum_dtheta_wall += local_acc.sum_dtheta_wall;
+      n_fit_ok += local_acc.n_fit_ok;
+      n_fit_fail += local_acc.n_fit_fail;
+      n_cls_ground += local_acc.n_cls_ground;
+      n_cls_wall += local_acc.n_cls_wall;
+      n_cls_mid += local_acc.n_cls_mid;
       for (auto& p : local_acc.plane_pts) {
         PointType pt; pt.x = p.x(); pt.y = p.y(); pt.z = p.z();
         plane_feat->push_back(pt);
@@ -985,6 +1320,68 @@ void SuperLIO::Observe(){
     HTVH_calib = sum_HTVH_calib.cast<scalar>();
     HTVr_calib = sum_HTVr_calib.cast<scalar>();
 
+    // ── Scan-based ground prior: the PITCH channel, with full leverage ──
+    // Constrains the CURRENT scan's ground normal — not the map's — so the Jacobian
+    // is O(1) and the lever arm is the whole ground patch, instead of the ~0.17 m
+    // 5-neighbour patch that made the map-normal snap a near no-op. Only the
+    // component along the direction of travel (the longitudinal grade) is
+    // constrained; the real cross-slope is left free, so roll is untouched.
+    if (g_structure_ground_enabled && scan_ground_valid_ && have_grade_ref) {
+      const M3d Rw = pose.R_.cast<double>();
+      const V3d n_w = Rw * scan_ground_n_b_.cast<double>();
+      const double cz = n_w.z();
+      if (std::abs(cz) > 0.3) {
+        const double a = n_w.dot(t_w);
+        const double s = -a / cz;         // tan(longitudinal grade) of the current scan
+        const double r = s - grade_ref;   // residual, tan units (≈ rad for small angles)
+        // ds/dn_w = -(cz*t - a*z)/cz²   ;   dn_w/d(dtheta) = -[n_w]x R
+        const V3d u = (cz * t_w - a * V3d(0.0, 0.0, 1.0)) / (cz * cz);
+        const V3d J = Rw.transpose() * (u.cross(n_w));  // body-frame rotation Jacobian
+        if (J.dot(J) > 1e-12) {
+          const double w = g_structure_ground_weight;
+          HTVH_pose.block<3, 3>(0, 0) += (w * J * J.transpose()).cast<scalar>();
+          HTVr_pose.head<3>() -= (w * J * r).cast<scalar>();
+          if (iter_num == 0) grade_resid_tan = r;
+        }
+      }
+    }
+
+    // ── Structural-regularity diagnostics ──────────────────────────────────
+    // Answers "did the constraint bite, and by how much?" — the question a null
+    // z-drift result cannot answer on its own. Written per frame (iter 0) to
+    // logs/structure.csv, plus a periodic INFO summary.
+    //   grade_resid_deg  = the pitch residual the scan-based prior actually fed the
+    //                      filter (tan of the longitudinal-grade error, in degrees).
+    //                      This is the number that must be non-trivial for the pitch
+    //                      channel to have any chance of overriding the drifting map.
+    //   ground_inliers   = ground points behind the scan fit (0 ⇒ channel idle).
+    //   dtheta_wall      = how far the wall snap moved the map normals (roll channel).
+    if (g_structure_wall_enabled || g_structure_ground_enabled) {
+      const double dth_w = (n_snap_wall > 0)
+          ? sum_dtheta_wall / n_snap_wall * 180.0 / M_PI : 0.0;
+      const double grade_deg = grade_resid_tan * 180.0 / M_PI;
+      if (iter_num == 0) {
+        static std::ofstream st("/home/creepert/Super-LIO/src/super_lio/logs/structure.csv",
+                                std::ios::app);
+        st << frame_num_ << "," << n_snap_wall << "," << dth_w << ","
+           << n_fit_ok << "," << n_fit_fail << ","
+           << n_cls_ground << "," << n_cls_wall << "," << n_cls_mid << ","
+           << (scan_ground_valid_ ? scan_ground_inliers_ : 0) << ","
+           << grade_deg << "," << (scan_ground_valid_ ? 1 : 0) << "\n";
+        static int st_count = 0;
+        if (++st_count <= 3 || st_count % 200 == 0) {
+          LOG(INFO) << "[Structure#" << st_count << "]"
+                    << " fit_ok=" << n_fit_ok << " fit_fail=" << n_fit_fail
+                    << " cls g/w/mid=" << n_cls_ground << "/" << n_cls_wall
+                    << "/" << n_cls_mid
+                    << " | snap_wall=" << n_snap_wall << " dtheta_wall=" << dth_w << "deg"
+                    << " | ground_inliers=" << (scan_ground_valid_ ? scan_ground_inliers_ : 0)
+                    << " grade_resid=" << grade_deg << "deg"
+                    << (scan_ground_valid_ ? "" : " (ground channel IDLE)");
+        }
+      }
+    }
+
     // ── Paper §3: per-frame H_pose + ΔC dump for Eq.(20) prediction validation ──
     // Columns: frame, H_pose(36), ΔC1(36), ΔC2(36) — row-major. Once per frame (iter 0).
     if (g_decouple_verify && iter_num == 0) {
@@ -998,6 +1395,35 @@ void SuperLIO::Observe(){
       for (int r = 0; r < 6; ++r)
         for (int c = 0; c < 6; ++c) pdc << "," << sum_DC2(r, c);
       pdc << "\n";
+    }
+
+    // ── Paper §3 (extended): H_pose + ΔC1/ΔC2 + timestamps + current relative extrinsic ──
+    // Columns: frame, scan_time, H_pose(36), ΔC1(36), ΔC2(36), rel_rpy(3), rel_xyz(3) — row-major.
+    // rel_* is T̂_L1⁻¹·T̂_L2 (rotation as angle-axis vector, translation in L1 frame); the analysis
+    // script subtracts the converged (physical) value to obtain ξ_Δ for the Eq.(20) projection.
+    if (g_pose_dc_dump && iter_num == 0) {
+      const SE3 T1 = kf_->getExtrinsic1();
+      const SE3 T2 = kf_->getExtrinsic2();
+      M3d R1T = T1.R_.transpose().cast<double>();
+      M3d R_rel = R1T * T2.R_.cast<double>();
+      V3d t_rel = R1T * (T2.t_.cast<double>() - T1.t_.cast<double>());
+      Eigen::AngleAxisd aa(R_rel);
+
+      static std::ofstream pdc2("/home/creepert/Super-LIO/src/super_lio/logs/pose_dc_v2.csv",
+                                std::ios::app);
+      // 时间戳用最新 IMU 采样时间：lidar.end_time 在重定位模式下不逐帧更新（恒为常量）
+      pdc2 << frame_num_ << ","
+           << (measures_.imu.empty() ? 0.0 : measures_.imu.back().secs);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_HTVH(r, c);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_DC1(r, c);
+      for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_DC2(r, c);
+      V3d rvec = aa.axis() * aa.angle();
+      for (int i = 0; i < 3; ++i) pdc2 << "," << rvec(i);
+      for (int i = 0; i < 3; ++i) pdc2 << "," << t_rel(i);
+      pdc2 << "\n";
     }
 
     // publish feature points for visualization
@@ -1035,6 +1461,16 @@ void SuperLIO::Observe(){
                   << " plane=" << plane_count
                   << " edge=" << edge_count
                   << " |HTVr|=" << sum_HTVr.norm();
+        {   // deskew-fallback accounting: a spike ⇒ the IMU bundle ended before the scan
+          const long n1 = stale_n1_.load(std::memory_order_relaxed);
+          const long n2 = stale_n2_.load(std::memory_order_relaxed);
+          LOG(INFO) << "[Stale#" << feat_diag_count << "]"
+                    << " L1 n=" << n1
+                    << " dt=" << (n1 ? double(stale_dt1_.load(std::memory_order_relaxed)) / n1 / 1e6 : 0.0)
+                    << "s | L2 n=" << n2
+                    << " dt=" << (n2 ? double(stale_dt2_.load(std::memory_order_relaxed)) / n2 / 1e6 : 0.0)
+                    << "s";
+        }
       }
     }
 
@@ -1067,7 +1503,41 @@ void SuperLIO::UpdateMap() {
 
 void SuperLIO::Output(){
   auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);  
+  data_wrapper_->pub_odom(state);
+
+  // ── Phase 1: calibration status log (before early return) ──
+  if (kf_->isCalibEnabled()) {
+    static int calib_log_count = 0;
+    int interval = (calib_log_count < 10) ? 1 : 200;
+    if (++calib_log_count % interval == 0) {
+      SE3 est1 = kf_->getExtrinsic1();
+      SE3 est2 = kf_->getExtrinsic2();
+      V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
+      V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
+      LOG(INFO) << CYAN << " ---> [Calib#" << calib_log_count
+                << "] ext1: t=[" << est1.t_.transpose()
+                << "] rpy=[" << rpy1.transpose() << "]°"
+                << " | ext2: t=[" << est2.t_.transpose()
+                << "] rpy=[" << rpy2.transpose() << "]°"
+                << RESET;
+    }
+  }
+
+  // ── Accelerometer / gyroscope bias (before early return) ──
+  // Print frequency is per processed frame, not per visual-map publish: below the
+  // g_visual_map gate this would only advance every g_pub_step frames, which made
+  // the logged index look like a frame number while being 1/g_pub_step of it.
+  {
+    static int bias_log_count = 0;
+    int interval = (bias_log_count < 10) ? 1 : 200;
+    if (++bias_log_count % interval == 0) {
+      auto st = kf_->GetSysState();
+      LOG(INFO) << YELLOW << " ---> [Bias#" << bias_log_count
+                << "] ba=[" << st.ba.transpose() << "] |ba|=" << st.ba.norm()
+                << " bg=[" << st.bg.transpose() << "] |bg|=" << st.bg.norm()
+                << RESET;
+    }
+  }
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
@@ -1091,23 +1561,6 @@ void SuperLIO::Output(){
     }
   }
 
-  // ── Phase 1: calibration status log ──
-  if (kf_->isCalibEnabled()) {
-    static int calib_log_count = 0;
-    int interval = (calib_log_count < 10) ? 1 : 200;
-    if (++calib_log_count % interval == 0) {
-      SE3 est1 = kf_->getExtrinsic1();
-      SE3 est2 = kf_->getExtrinsic2();
-      V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
-      V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
-      LOG(INFO) << CYAN << " ---> [Calib#" << calib_log_count
-                << "] ext1: t=[" << est1.t_.transpose()
-                << "] rpy=[" << rpy1.transpose() << "]°"
-                << " | ext2: t=[" << est2.t_.transpose()
-                << "] rpy=[" << rpy2.transpose() << "]°"
-                << RESET;
-    }
-  }
 }
 
 void SuperLIO::printTimeRecord(){

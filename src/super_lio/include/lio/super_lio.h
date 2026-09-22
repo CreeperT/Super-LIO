@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cassert>
 #include <filesystem>
+#include <atomic>
 
 #include <pcl/io/pcd_io.h>
 #include <pcl/common/transforms.h>
@@ -51,6 +52,12 @@ protected:
   void caceData();
   void ProcessCaceMap();
 
+  /// Robust plane fit of the ground from the CURRENT scan, in the body (IMU) frame.
+  /// The map's own ground planes cannot be used for the structural prior: they were
+  /// built by the drifting estimate and therefore carry the very tilt we measure.
+  /// Returns the unit normal (pointing up) and the inlier count.
+  bool fit_scan_ground(BASIC::V3& n_body, int& n_inliers) const;
+
   using StateFn = void (SuperLIO::*)();
   using OctVoxMapType = OctVoxMap<BASIC::V3, BASIC::scalar>;
   using KNNHeapType = KNNHeap<5, BASIC::V3>;
@@ -93,6 +100,47 @@ protected:
   int pcd_index_ = -1;
   int skip_observe_frames_ = 0;  // frames to skip Observe after map reset
   bool allow_map_reset_ = true;  // relocation mode sets this to false
+
+  // ── Structural regularity ──────────────────────────────────────────────
+  // The ground is NOT necessarily horizontal (this site has a real cross-slope of
+  // up to ±5°), so floor planes must never be snapped to world-vertical. What is
+  // captured here is the terrain's own normal during the initial stationary
+  // segment; at runtime only its component ALONG THE DIRECTION OF TRAVEL (the
+  // longitudinal grade) is enforced, leaving the cross-slope untouched.
+  BASIC::V3 ground_ref_w_ = BASIC::V3::Zero();  // world-frame terrain normal at startup
+  int  ground_ref_count_ = 0;                   // plane samples accumulated
+  int  ground_ref_frames_ = 0;                  // frames spent capturing
+  bool ground_ref_done_ = false;                // capture finished (success or gave up)
+  BASIC::V3 travel_dir_w_ = BASIC::V3::Zero();  // last valid horizontal travel direction
+  bool travel_dir_valid_ = false;
+  // Route direction. Only the manual grade reference (ground_grade_deg, a scalar) needs
+  // it: that scalar has no world-frame axis of its own, so it is defined w.r.t. this
+  // direction and gets negated once the platform turns around. The captured normal plays
+  // the same role for the auto reference, which is why the auto branch needs no latch.
+  // Taken from the platform's DISPLACEMENT after it exceeds kRouteLatchDist, not from the
+  // instantaneous velocity: right after init the 0.15 m/s gate alone can be passed by
+  // jitter, and a reversed latch mirrors the reference for the whole run.
+  BASIC::V3 travel_dir0_w_ = BASIC::V3::Zero();    // horizontal route direction (unit)
+  BASIC::V3 travel_dir0_p0_ = BASIC::V3::Zero();   // position when the first valid direction appeared
+  bool travel_dir0_pending_ = false;               // p0 taken, waiting for the displacement
+  bool travel_dir0_valid_ = false;
+
+  // Per-frame ground plane fitted from the current scan (body frame), used by the
+  // scan-based grade residual. Unlike the map-normal snap, this has full attitude
+  // leverage: its Jacobian is O(1) rather than O(|p_w − c|).
+  BASIC::V3 scan_ground_n_b_ = BASIC::V3::Zero();
+  int  scan_ground_inliers_ = 0;
+  bool scan_ground_valid_ = false;
+
+  // ── Deskew-fallback accounting (Propagation_Undistort) ───────────────────
+  // A point whose timestamp exceeds the last propagated IMU state is copied RAW with
+  // v_body = 0 — the sweep is then not motion-compensated at all, which biases the
+  // scan match toward "not moving" and can collapse the ESKF velocity. A spike here
+  // means the IMU bundle of that frame ended before the scan did (timing-dependent).
+  // Written inside a tbb::parallel_for ⇒ atomics; per-frame, reset at the top of the
+  // undistort and reported next to [FeatDiag].
+  std::atomic<long> stale_n1_{0}, stale_n2_{0};          // counts (LiDAR1 / LiDAR2)
+  std::atomic<long> stale_dt1_{0}, stale_dt2_{0};        // Σ(query_time − last IMU time), µs
 
   Timer time_record_;
 };

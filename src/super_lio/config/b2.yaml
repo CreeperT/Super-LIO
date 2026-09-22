@@ -80,11 +80,31 @@
     #                            -0.5, 0.0, 0.866025]
 
     # 故意加误差的外参（用于测试在线标定恢复能力）
-    lio.lidar2.extrinsic_imu: [-0.3, 0.02, 0.20,    # 平移加了 2cm y, 5cm z
-                                0.819152, 0.0, 0.573576,  # pitch 35° 而非 30°
-                                0.0, 1.0, 0.0,
-                              -0.573576, 0.0, 0.819152]
+    # lio.lidar2.extrinsic_imu: [-0.3, 0.02, 0.20,    # 平移加了 2cm y, 5cm z
+    #                             0.819152, 0.0, 0.573576,  # pitch 35° 而非 30°
+    #                             0.0, 1.0, 0.0,
+    #                           -0.573576, 0.0, 0.819152]
 
+
+    # （外参误差组梯子；平移 +2cm y, +5cm z 为所有误差组共用）↑ 当前启用 = pitch +5°（35°）
+
+    # pitch +10° (40°, cos=0.766044, sin=0.642788)
+    # lio.lidar2.extrinsic_imu: [-0.3, 0.02, 0.20,
+    #                             0.766044, 0.0, 0.642788,
+    #                             0.0, 1.0, 0.0,
+    #                           -0.642788, 0.0, 0.766044]
+
+    # pitch +15° (45°, cos=0.707107, sin=0.707107) —— Ry(45°)，已修正（备份原值误为 35°）
+    # lio.lidar2.extrinsic_imu: [-0.3, 0.02, 0.20,
+    #                             0.707107, 0.0, 0.707107,
+    #                             0.0, 1.0, 0.0,
+    #                           -0.707107, 0.0, 0.707107]
+
+    # 在线外参标定收敛后的冻结值（相对 L1↔L2 修正 1.73°；fix2 臂实测来源，见 CHANGELOG 续 16）
+    lio.lidar2.extrinsic_imu: [-0.29807, -0.01333, 0.20766,
+                                0.868991, 0.026805, 0.494102,
+                               -0.029258, 0.999568, -0.002770,
+                               -0.493963, -0.012050, 0.869400]
 
     # ===================== 地图（OctVoxMap）========================
     lio.hash_map.hash_capacity: 100000000 # 体素容量上限（LRU淘汰）
@@ -149,7 +169,7 @@
     lio.feature.high_intensity_edge_boost: 3.0  # 高强点线特征额外倍数（反光柱纵向约束）
 
     # ===================== 在线标定 (Phase 1) ====================
-    lio.calib.enable_online_calib: true     # 启用在线外参+时偏估计
+    lio.calib.enable_online_calib: false     # 启用在线外参+时偏估计
     lio.calib.ext_rot_rw: 1.7e-4            # 外参旋转随机游走(rad/√s) ≈0.01°/√s
     lio.calib.ext_trans_rw: 1.0e-4          # 外参平移随机游走(m/√s) ≈0.1mm/√s
     lio.calib.dt_rw: 1.0e-6                 # 时间偏移随机游走(s/√s) ≈1μs/√s
@@ -158,3 +178,22 @@
     lio.degeneracy.enabled: true          # DEBUG: 测试空房间停滞是否由退化投影引起
     lio.degeneracy.max_stddev: 0.25          # 后验平移标准差>此值(m)→触发解映射
     lio.degeneracy.htvh_cond_thresh: 30.0  # HTVH平移块条件数>此值→约束不均衡退化
+
+    # ===================== 结构正则性（两个独立通道）================
+    # 用途：切断"姿态漂移 → 地图跟着歪 → 残差自洽"的反馈链。两通道观测不同自由度，故分开开关：
+    #   墙   → 约束 roll （绕墙法向的旋转不改变法向，故墙对 pitch 结构性失明）
+    #   地面 → 约束 pitch（只有水平面能看 pitch）
+    # 地面法向的绝对朝向就是地形本身（本场地实测横向坡度达 ±5°），故只约束"沿行进方向"的
+    # 纵向分量，横向坡度原样保留。此六键必须**存在**：run_graft_n.sh 的 set_yaml 只替换已存在
+    # 的行、不新增，缺键时旧版会静默 no-op（见 CHANGELOG 续 17）。
+    lio.structure.wall_enabled: true        # 墙吸附竖直 → roll（代码默认 false）
+    lio.structure.ground_enabled: true      # 地面纵向约束 → pitch（代码默认 false）
+    lio.structure.ground_grade_auto: false   # 初始化静止段自动捕获地形法向作为参考
+    lio.structure.ground_grade_deg: 0.566     # 手动参考纵向坡度（auto=false 时生效，°）
+    # 权重与 LiDAR 姿态块同量纲（实测 H_pose 旋转块对角 4.4e5/1.85e7/3.09e7）：
+    # 1.0e6 压不动（|Δz| 中位 8.01 m，有效 0/5），1.0e7 生效（6/6 成立）。
+    # ⚠ auto 参考不可自举：5#GJD 实测参考散布 0.051–1.735°，地图爬升 1.14–11.29 m（真值 ≈3.7 m）。
+    # 要 z 可用须走 GRADE_AUTO=false GRADE_DEG=<外部实测值>（本数据集 0.566）——
+    # 该值必须外部获取（现场测量/设计文档），不从先验地图取。
+    lio.structure.ground_weight: 1.0e7
+    lio.structure.max_angle_deg: 20.0       # 墙分类阈值：偏离竖直超过此角度则不吸附（°）

@@ -1,6 +1,7 @@
 #include "lio/ESKF.h"
 #include "basic/logs.h"
 #include <fstream>
+#include <chrono>   // 解算耗时埋点（论文表 VII：联合 32³ vs 解耦 18³+14³）
 
 using namespace BASIC;
 
@@ -433,6 +434,8 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   COV Pk;
   NAV_MAT Qk_nav;
+  // 解算耗时累加器（作用域需覆盖迭代循环与函数末尾的落盘处）
+  double _t_nav_us = 0.0, _t_calib_us = 0.0, _t_joint_us = 0.0;
 
   need_converge_ = false;
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
@@ -477,8 +480,11 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     error_dx_nav.template block<6,1>(0, 0) = HTVr_pose;
 
     // Solve 18×18 navigation subsystem
+    auto _tp0 = std::chrono::steady_clock::now();
     Qk_nav = Pk_inv_nav.inverse();
-    NAV_VEC dx_nav = Qk_nav * error_dx_nav;
+    _t_nav_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - _tp0).count();
+    NAV_VEC dx_nav = Qk_nav * error_dx_nav;   // 回代不计入：口径统一为"仅矩阵求逆"
 
     // ── 18×18 vs 32×32 equivalence verification (paper support) ──
     if (g_decouple_verify) {
@@ -489,7 +495,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       Pk_inv_full.block<6,6>(0,0) += HTVH_pose;
       STATE err_full = STATE::Zero();
       err_full.block<6,1>(0,0) = HTVr_pose;
+      auto _tj0 = std::chrono::steady_clock::now();
       COV Qk_full = Pk_inv_full.inverse();
+      _t_joint_us = std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - _tj0).count();
       STATE dx_full = Qk_full * err_full;
       double diff_nav = (dx_nav - dx_full.head<18>()).norm();
       double diff_calib = dx_full.tail<14>().norm();
@@ -568,7 +577,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   if (calib_enabled_) {
     // Extract calibration sub-blocks from P
     Eigen::Matrix<scalar, 14, 14> P_calib = P_.block<14,14>(18, 18);
+    auto _tc0 = std::chrono::steady_clock::now();
     Eigen::Matrix<scalar, 14, 14> S_calib = P_calib.inverse();
+    _t_calib_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - _tc0).count();
     S_calib += HTVH_calib.block<14,14>(6, 6).cast<scalar>();
 
     Eigen::Matrix<scalar, 14, 1> dx_calib =
@@ -614,6 +626,14 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     P_.block<14,14>(18, 18) = (Eigen::Matrix<scalar, 14, 14>::Identity()
                                 - K_calib * HTVH_calib.block<14,14>(6, 6).cast<scalar>())
                                * P_calib;
+  }
+
+  // ── 解算耗时与标定时偏落盘（论文表 VII 运行时间 / 表 VIII 时偏行）──
+  {
+    static int _st_cnt = 0;
+    static std::ofstream st("/home/creepert/Super-LIO/src/super_lio/logs/solver_time.csv", std::ios::app);
+    st << (++_st_cnt) << "," << _t_nav_us << "," << _t_calib_us << "," << _t_joint_us
+       << "," << delta_t1_ << "," << delta_t2_ << "\n";
   }
 
   Pk = P_;

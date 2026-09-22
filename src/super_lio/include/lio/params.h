@@ -32,6 +32,7 @@ namespace LI2Sup{
   extern bool g_time_eva;
   extern bool g_verbose_logging;  // enable per-frame diagnostic logs
   extern bool g_decouple_verify;  // compare 18×18 decoupled vs 32×32 full solve
+  extern bool g_pose_dc_dump;     // dump per-frame H_pose + ΔC + relative extrinsic (Eq.(20) analysis)
 
   extern bool g_save_map;
   extern bool g_if_filter;
@@ -131,6 +132,14 @@ namespace LI2Sup{
   extern bool   g_degeneracy_enabled;
   extern double g_degeneracy_max_stddev;       // posterior σ > this (meters) → degenerate
   extern double g_degeneracy_htvh_cond_thresh; // HTVH trans κ > this → constraint imbalance
+
+  /// structural regularity prior — two independent channels
+  extern bool   g_structure_wall_enabled;       // vertical planes → constrain roll
+  extern bool   g_structure_ground_enabled;     // floor longitudinal component → constrain pitch
+  extern bool   g_structure_ground_grade_auto;  // capture the terrain grade in the init stationary segment
+  extern double g_structure_ground_grade_deg;   // manual reference longitudinal grade (deg), used when auto is off
+  extern double g_structure_ground_weight;      // information weight of the scan-based grade residual
+  extern double g_structure_max_angle_deg;      // classification: max deviation from an axis (deg)
 
   /// for relocation
   extern bool g_update_map;

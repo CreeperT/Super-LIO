@@ -152,6 +152,32 @@ private:
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
 
+  // ── Input-side accounting ────────────────────────────────────────────────
+  // Whether the node RECEIVED what was sent. The output-side coverage cannot see
+  // input drops (a stream that loses messages still publishes at full rate, with
+  // no gaps), and a dropped IMU run under-integrates the ESKF prediction: the pose
+  // then only creeps under the (softer) LiDAR updates while the features stay
+  // healthy. Subscriptions are KeepLast/best_effort, so a blocked executor drops
+  // silently — only these counters can show it.
+  struct InStat {
+    long   n = 0;
+    double first = -1.0, last = -1.0;
+    double max_gap = 0.0, sum_gap = 0.0;
+    void add(double t) {
+      if (first < 0.0) first = t;
+      else {
+        const double g = t - last;
+        if (g > max_gap) max_gap = g;
+        if (g > 0.0) sum_gap += g;
+      }
+      last = t;
+      ++n;
+    }
+  };
+  InStat in_imu_, in_scan1_, in_scan2_;
+  double in_log_t_ = -1.0;   // header time of the last [Input#] report
+  void logInputAccounting(double t);
+
   ESKF::Ptr eskf_{nullptr};
 
   nav_msgs::msg::Path path_;

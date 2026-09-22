@@ -15,6 +15,7 @@ namespace LI2Sup{
   bool g_time_eva = false;
   bool g_verbose_logging = false;  // per-frame diagnostic logs (off by default)
   bool g_decouple_verify = false;  // compare 18×18 decoupled vs 32×32 full solve
+  bool g_pose_dc_dump = false;     // dump per-frame H_pose + ΔC + relative extrinsic (Eq.(20) analysis)
 
   bool   g_save_map;
   bool   g_if_filter; 
@@ -108,6 +109,20 @@ namespace LI2Sup{
   bool   g_degeneracy_enabled = true;
   double g_degeneracy_max_stddev = 0.5;        // meters
   double g_degeneracy_htvh_cond_thresh = 100.0;
+
+  /// structural regularity prior — two independent channels.
+  /// Roll comes from walls (vertical planes); pitch can only come from horizontal
+  /// surfaces, and their absolute orientation IS the terrain, so the ground channel
+  /// is opt-in and parameterised rather than assumed horizontal.
+  bool   g_structure_wall_enabled = false;
+  bool   g_structure_ground_enabled = false;
+  bool   g_structure_ground_grade_auto = true;
+  double g_structure_ground_grade_deg = 0.0;
+  // Weight of the scan-based grade residual, in the same information units as the
+  // LiDAR pose block. Measured on 5#GJD, the LiDAR's own H_pose rotation block has
+  // diagonal 4.4e5 / 1.85e7 / 3.09e7, so this must sit in that range to matter.
+  double g_structure_ground_weight = 1.0e6;
+  double g_structure_max_angle_deg = 20.0;
 
   /// for relocation
   bool g_update_map = false;

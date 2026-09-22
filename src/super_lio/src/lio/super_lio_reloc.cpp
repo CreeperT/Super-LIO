@@ -532,11 +532,10 @@ bool SuperLIOReLoc::kf_init(){
 
   float imu_scale = g_gravity_norm / mean_acce.norm();
 
-  // Estimate accelerometer bias from stationary init data.
-  // At rest: measured = -gravity_imu + bias.  mean_acce ≈ -gravity_imu + bias.
-  // Expected static acc = mean_acce.normalized() * g ≈ -gravity_imu (unbiased).
-  // Therefore bias ≈ mean_acce - expected = mean_acce * (1 - g/|mean|).
-  V3 estimated_ba = mean_acce * (1.0f - imu_scale);
+  // See the note in SuperLIO::kf_init(): imu_scale already absorbs the radial part
+  // of the accelerometer bias, so subtracting mean_acce * (1 - imu_scale) as well
+  // double-counts it and injects a constant vertical specific-force error.
+  V3 estimated_ba = imu_scale * mean_acce - mean_acce.normalized() * g_gravity_norm;
 
   kf_->SetInitialConditions(options, mean_gyro, estimated_ba, imu_scale, ref_gravity);
   auto state = kf_->GetSysState();
@@ -653,6 +652,20 @@ void SuperLIOReLoc::Output() {
           }
         }
       }
+    }
+  }
+
+  // ── Accelerometer / gyroscope bias ──
+  // Outside the calibration gate on purpose — see the note in SuperLIO::stateProcess().
+  {
+    static int bias_log_count = 0;
+    int interval = (bias_log_count < 10) ? 1 : 100;
+    if (++bias_log_count % interval == 0) {
+      auto st = kf_->GetSysState();
+      LOG(INFO) << YELLOW << " ---> [Bias#" << bias_log_count
+                << "] ba=[" << st.ba.transpose() << "] |ba|=" << st.ba.norm()
+                << " bg=[" << st.bg.transpose() << "] |bg|=" << st.bg.norm()
+                << RESET;
     }
   }
 

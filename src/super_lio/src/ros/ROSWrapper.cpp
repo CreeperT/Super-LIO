@@ -9,6 +9,9 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
+// Reporting period of the [Input] accounting line (seconds of header time).
+static constexpr double IN_LOG_SEC = 100.0;
+
 void LoadParamFromRos(rclcpp::Node& node)
 {
   node.declare_parameter<bool>("lio.map.save_map", false);
@@ -25,6 +28,9 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<bool>("lio.eva.decouple_verify", false);
   node.get_parameter("lio.eva.decouple_verify", g_decouple_verify);
+
+  node.declare_parameter<bool>("lio.eva.pose_dc_dump", false);
+  node.get_parameter("lio.eva.pose_dc_dump", g_pose_dc_dump);
 
   node.declare_parameter<bool>("lio.map.if_filter", false);
   node.get_parameter("lio.map.if_filter", g_if_filter);
@@ -344,6 +350,28 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<double>("lio.degeneracy.htvh_cond_thresh", 100.0);
   node.get_parameter("lio.degeneracy.htvh_cond_thresh", g_degeneracy_htvh_cond_thresh);
 
+  // ================= structural regularity =================
+  // Two independent channels: walls constrain roll, the ground's longitudinal
+  // component constrains pitch. The ground channel needs a terrain prior (the
+  // ground is not necessarily horizontal), hence it is opt-in and parameterised.
+  node.declare_parameter<bool>("lio.structure.wall_enabled", false);
+  node.get_parameter("lio.structure.wall_enabled", g_structure_wall_enabled);
+
+  node.declare_parameter<bool>("lio.structure.ground_enabled", false);
+  node.get_parameter("lio.structure.ground_enabled", g_structure_ground_enabled);
+
+  node.declare_parameter<bool>("lio.structure.ground_grade_auto", true);
+  node.get_parameter("lio.structure.ground_grade_auto", g_structure_ground_grade_auto);
+
+  node.declare_parameter<double>("lio.structure.ground_grade_deg", 0.0);
+  node.get_parameter("lio.structure.ground_grade_deg", g_structure_ground_grade_deg);
+
+  node.declare_parameter<double>("lio.structure.ground_weight", 1.0e6);
+  node.get_parameter("lio.structure.ground_weight", g_structure_ground_weight);
+
+  node.declare_parameter<double>("lio.structure.max_angle_deg", 20.0);
+  node.get_parameter("lio.structure.max_angle_deg", g_structure_max_angle_deg);
+
   // ================= relocation robustness =================
   node.declare_parameter<int>("lio.relocation.init_frames", 5);
   node.get_parameter("lio.relocation.init_frames", g_reloc_init_frames);
@@ -545,7 +573,34 @@ void ROSWrapper::setupIO(){
 }
 
 
+// Input-side accounting, one line per IN_LOG_SEC of header time. Reports the message
+// count and, more importantly, the EFFECTIVE rate (1/mean inter-arrival) and the largest
+// gap: those two reveal silent drops without needing to know the nominal rate. Called
+// from the scan handlers, so the line keeps coming even if the IMU stream dies.
+void ROSWrapper::logInputAccounting(double t){
+  if (in_log_t_ < 0.0) { in_log_t_ = t; return; }
+  const double dt = t - in_log_t_;
+  if (dt < IN_LOG_SEC) return;
+  const auto rate_of = [](const InStat& s) {
+    return (s.n > 1 && s.sum_gap > 1e-9) ? (s.n - 1) / s.sum_gap : 0.0;
+  };
+  LOG(INFO) << " ---> [Input] " << std::fixed << std::setprecision(1) << dt << "s: "
+            << "imu n=" << in_imu_.n << " rate=" << std::setprecision(1) << rate_of(in_imu_)
+            << "Hz maxgap=" << std::setprecision(3) << in_imu_.max_gap << "s"
+            << " | scan1 n=" << in_scan1_.n << " rate=" << std::setprecision(1) << rate_of(in_scan1_)
+            << "Hz maxgap=" << std::setprecision(3) << in_scan1_.max_gap << "s"
+            << " | scan2 n=" << in_scan2_.n << " rate=" << std::setprecision(1) << rate_of(in_scan2_)
+            << "Hz maxgap=" << std::setprecision(3) << in_scan2_.max_gap << "s";
+  in_log_t_ = t;
+  for (InStat* s : {&in_imu_, &in_scan1_, &in_scan2_}) {   // keep `last` so the boundary gap survives
+    s->n = 0;
+    s->sum_gap = 0.0;
+    s->max_gap = 0.0;
+  }
+}
+
 void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
+  in_imu_.add(stampToSec(msg->header.stamp));
   IMUData data;
   data.secs = stampToSec(msg->header.stamp);
   data.acc  = V3(msg->linear_acceleration.x,
@@ -619,6 +674,8 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
 void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
   if(msg->point_num < 10) return;
+  in_scan1_.add(stampToSec(msg->header.stamp));
+  logInputAccounting(stampToSec(msg->header.stamp));
   updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
@@ -646,6 +703,8 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
 
 void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
   if(msg->data.size() < 10) return;
+  in_scan1_.add(stampToSec(msg->header.stamp));
+  logInputAccounting(stampToSec(msg->header.stamp));
   updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -768,6 +827,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
 
 void ROSWrapper::livoxHandler2(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
   if(msg->point_num < 10) return;
+  in_scan2_.add(stampToSec(msg->header.stamp));
   updateLidar2Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
@@ -797,6 +857,7 @@ void ROSWrapper::livoxHandler2(const livox_ros_driver2::msg::CustomMsg::SharedPt
 
 void ROSWrapper::stdMsgHandler2(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
   if(msg->data.size() < 10) return;
+  in_scan2_.add(stampToSec(msg->header.stamp));
   updateLidar2Clock(stampToSec(msg->header.stamp));
 
   LidarData lidar_data;
