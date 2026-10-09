@@ -98,6 +98,14 @@ namespace LI2Sup{
   extern bool g_visual_map;
   extern bool g_visual_dense;
   extern int  g_pub_step;
+  extern bool g_lidar_qos_reliable;   // (A) 雷达订阅 QoS 与发布端 offered profile 对齐（RELIABLE）
+  // (C1) 允许 lidar2-only 量测组：lidar1 断流时第二雷达不再被整段丢弃（真机鲁棒性项）
+  // 默认 false = 原行为（任一解算都要求一个 lidar1 帧到位）⇒ 关时零行为变化。
+  extern bool g_lidar2_only_enable;
+  // (C1) **断流门控**：仅当「数据时间轴上 lidar1 已缺席 > 该秒数」才放行 lidar2-only 组。
+  // 不加此门控时，10 Hz 两雷达的相位错开会让**正常段**也不断命中 else 分支 ⇒ 帧率翻倍
+  // （实测 10.0 → 19.3 Hz，见 CHANGELOG 续 43）⇒ 该开关会改变标称行为，与设计意图不符。
+  extern double g_lidar2_only_gap;
   extern bool g_nav2_tf;    // publish map→odom→base_link for Nav2
 
   /// for planner

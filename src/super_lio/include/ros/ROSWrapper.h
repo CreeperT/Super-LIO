@@ -151,6 +151,9 @@ private:
   bool lidar_pushed_ = false;
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
+  // (C1) 断流门控用：lidar1 消息的最后**到达墙钟**（不依赖雷达/IMU 时基约定）+ 诊断限流
+  double t_last_lidar1_wall_ = -1.0;
+  double dbg_c1_t_ = 0.0;
 
   // ── Input-side accounting ────────────────────────────────────────────────
   // Whether the node RECEIVED what was sent. The output-side coverage cannot see
@@ -163,7 +166,25 @@ private:
     long   n = 0;
     double first = -1.0, last = -1.0;
     double max_gap = 0.0, sum_gap = 0.0;
+    /// (①) 回放滞后：l = now − header，参考点取**全程首帧**（永不重置）⇒ "持续落后、跨窗不收敛"
+    /// 的积压表现为逐窗 mean 单调增长。若参考点取窗内首帧，这个模式会被每窗归零抹掉（M5）。
+    struct Lag {
+      bool   has_ref = false;
+      double ref = 0.0;              // 全程首帧的 l
+      long   n = 0;                  // 以下为窗口字段，随 [Input] 报告清空
+      double sum = 0.0, mn = 0.0, mx = 0.0;
+      void add(double t_hdr, double t_now) {
+        const double l = t_now - t_hdr;
+        if (!has_ref) { has_ref = true; ref = l; }
+        const double d = l - ref;
+        if (!n) { mn = mx = d; } else { if (d < mn) mn = d; if (d > mx) mx = d; }
+        sum += d; ++n;
+      }
+      void clear_window() { n = 0; sum = 0.0; mn = 0.0; mx = 0.0; }
+      double mean() const { return n ? sum / n : 0.0; }
+    } lag;
     void add(double t) {
+      lag.add(t, rclcpp::Clock().now().seconds());   // (①) 逐帧记回放滞后（5 个调用点无需改）
       if (first < 0.0) first = t;
       else {
         const double g = t - last;

@@ -282,6 +282,15 @@ bool SuperLIO::kf_init(){
 bool SuperLIO::map_init(){
   frame_num_++;
 
+  // (C1) 初始化阶段仍要求 lidar1 帧：lidar2-only 组不入图，等 lidar1 恢复
+  //（避免空指针 pc==nullptr，也避免用单雷达完成建图初始化的半初始化状态）
+  if (!measures_.has_lidar1 || !measures_.lidar.pc) {
+    if (frame_num_ <= 3) {
+      LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] map_init skipped: no lidar1 frame in group" << RESET;
+    }
+    return false;
+  }
+
   std::size_t ptsize = measures_.lidar.pc->size();
   points_world_v3_.resize(ptsize);
 
@@ -492,7 +501,8 @@ inline double get_cpu_time_seconds() {
 void SuperLIO::Propagation_Undistort(){
   propagate_states_.clear();
   propagate_states_.emplace_back(kf_->GetDynamicState());
-  kf_->SetObsTime(measures_.lidar.end_time);
+  // (C1) 本组的时间基准：有 lidar1 用它，否则用 lidar2（lidar2-only 组）
+  kf_->SetObsTime(measures_.has_lidar1 ? measures_.lidar.end_time : measures_.lidar2.end_time);
   for (auto &imu : measures_.imu) {
     kf_->Predict(imu);
     propagate_states_.emplace_back(kf_->GetDynamicState());
@@ -516,7 +526,8 @@ void SuperLIO::Propagation_Undistort(){
     const double start_time = measures_.lidar.start_time;
     auto& raw_pc = measures_.lidar.pc;
 
-    std::size_t ptsize = raw_pc->points.size();
+    // (C1) lidar2-only 组：raw_pc == nullptr ⇒ ptsize=0，本块整体空转（后续按实际 size 合并 lidar2）
+    std::size_t ptsize = raw_pc ? raw_pc->points.size() : 0;
     scan_undistort_full_->resize(ptsize);
     full_motion_info_.resize(ptsize);  // Phase 2: per-point velocity for time-offset Jacobian
 

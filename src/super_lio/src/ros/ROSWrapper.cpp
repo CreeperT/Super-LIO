@@ -20,6 +20,26 @@ void LoadParamFromRos(rclcpp::Node& node)
   LOG(INFO) << GREEN << " ---> [Param] map/save_map: "
             << (g_save_map ? "true" : "false") << RESET;
 
+  // (A) 雷达订阅 QoS。发布端 offered profile 实测 = RELIABLE(1)/depth 100|256（5#GJD bag
+  // metadata，两个雷达 topic 都是），而节点原为 best_effort ⇒ 对该 reader 链路降级、丢包静默：
+  // 实测 scan1 仅 9.05 Hz，而同轮 recorder 因按 offered 匹配为 RELIABLE 收满 10.00 Hz。
+  // 默认 false = 保持原行为 ⇒ 开/关由配置切换，臂参数化不需要重编（判据卡 M3）。
+  node.declare_parameter<bool>("lio.ros.lidar_qos_reliable", false);
+  node.get_parameter("lio.ros.lidar_qos_reliable", g_lidar_qos_reliable);
+  LOG(INFO) << GREEN << " ---> [Param] ros/lidar_qos_reliable: "
+            << (g_lidar_qos_reliable ? "true (RELIABLE)" : "false (best_effort)") << RESET;
+
+  // (C1) lidar2-only 量测组：lidar1 断流时让第二雷达继续参与解算。默认 false = 原门控。
+  node.declare_parameter<bool>("lio.ros.lidar2_only_update", false);
+  node.get_parameter("lio.ros.lidar2_only_update", g_lidar2_only_enable);
+  // (C1) 断流门控阈值：仅当 lidar1 已缺席超过该秒数，才允许 lidar2-only 组（避免正常段翻倍出解）
+  node.declare_parameter<double>("lio.ros.lidar2_only_gap", 0.3);
+  node.get_parameter("lio.ros.lidar2_only_gap", g_lidar2_only_gap);
+  LOG(INFO) << GREEN << " ---> [Param] ros/lidar2_only_update: "
+            << (g_lidar2_only_enable ? "true (lidar2-only groups allowed)" : "false (lidar1 gates every update)")
+            << (g_lidar2_only_enable ? (" | outage_gap=" + std::to_string(g_lidar2_only_gap) + "s") : "")
+            << RESET;
+
   node.declare_parameter<bool>("lio.eva.timer", false);
   node.get_parameter("lio.eva.timer", g_time_eva);
 
@@ -504,9 +524,11 @@ void ROSWrapper::setupIO(){
                  .best_effort()
                  .durability_volatile();
 
-  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(20))
-                   .best_effort()
-                   .durability_volatile();
+  // (A) 见 LoadParamFromRos：发布端是 RELIABLE，best_effort 订阅在丢包时静默丢帧。
+  // depth 仍 20（不引入第二个变量）；imu 不动（500 Hz、maxgap 仅 0.004–0.006 s，无丢帧）。
+  auto lidar_qos = g_lidar_qos_reliable
+                   ? rclcpp::QoS(rclcpp::KeepLast(20)).reliable().durability_volatile()
+                   : rclcpp::QoS(rclcpp::KeepLast(20)).best_effort().durability_volatile();
 
   sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
       g_imu_topic,
@@ -590,12 +612,17 @@ void ROSWrapper::logInputAccounting(double t){
             << " | scan1 n=" << in_scan1_.n << " rate=" << std::setprecision(1) << rate_of(in_scan1_)
             << "Hz maxgap=" << std::setprecision(3) << in_scan1_.max_gap << "s"
             << " | scan2 n=" << in_scan2_.n << " rate=" << std::setprecision(1) << rate_of(in_scan2_)
-            << "Hz maxgap=" << std::setprecision(3) << in_scan2_.max_gap << "s";
+            << "Hz maxgap=" << std::setprecision(3) << in_scan2_.max_gap << "s"
+            << " | lag(相对全程首帧,s) imu " << std::setprecision(3) << in_imu_.lag.mean()
+            << "[" << in_imu_.lag.mn << "," << in_imu_.lag.mx << "]"
+            << " 1 " << in_scan1_.lag.mean() << "[" << in_scan1_.lag.mn << "," << in_scan1_.lag.mx << "]"
+            << " 2 " << in_scan2_.lag.mean() << "[" << in_scan2_.lag.mn << "," << in_scan2_.lag.mx << "]";
   in_log_t_ = t;
   for (InStat* s : {&in_imu_, &in_scan1_, &in_scan2_}) {   // keep `last` so the boundary gap survives
     s->n = 0;
     s->sum_gap = 0.0;
     s->max_gap = 0.0;
+    s->lag.clear_window();                                 // 全程 ref 保留 ⇒ 跨窗积压可见（M5）
   }
 }
 
@@ -676,6 +703,7 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
   if(msg->point_num < 10) return;
   in_scan1_.add(stampToSec(msg->header.stamp));
   logInputAccounting(stampToSec(msg->header.stamp));
+  t_last_lidar1_wall_ = stampToSec(this->now());   // (C1) 断流门控基准
   updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
@@ -705,6 +733,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
   if(msg->data.size() < 10) return;
   in_scan1_.add(stampToSec(msg->header.stamp));
   logInputAccounting(stampToSec(msg->header.stamp));
+  t_last_lidar1_wall_ = stampToSec(this->now());   // (C1) 断流门控基准
   updateLidar1Clock(stampToSec(msg->header.stamp));
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -990,52 +1019,89 @@ void ROSWrapper::stdMsgHandler2(const sensor_msgs::msg::PointCloud2::SharedPtr m
 
 
 bool ROSWrapper::sync_measure(MeasureGroup& meas){
-  if (lidar_buffer_.empty() || imu_buffer_.empty()) {
+  // (C1) lidar2-only 组：lidar1 断流时不再整段丢弃第二雷达。
+  // 开关为 false 时（默认）本行条件与原来的 `lidar_buffer_.empty() || imu_buffer_.empty()` **等价**，
+  // 且下方 else 分支不可达 ⇒ OFF 路径行为逐字节不变。
+  const bool have1 = !lidar_buffer_.empty();
+  const bool have2 = g_dual_lidar_enable && !lidar_buffer_2_.empty();
+  // (C1) **断流门控**：以 **墙钟** 计（lidar1 消息的到达间隔）——不依赖雷达/IMU 的时基约定，
+  // 避免数据时间轴上的隐性偏移把判据恒置为假（实测踩坑：数据时间版本恒假 ⇒ 断流也不放行）。
+  // ⚠ 回放速率 ≠ 1.0 时该阈值按墙钟折算。缺此门控则正常段（两雷达相位错开）也命中 ⇒ 帧率翻倍（10.0 → 19.3 Hz）。
+  const double now_s = stampToSec(this->now());
+  const bool lidar1_outage = g_lidar2_only_enable && have2 && t_last_lidar1_wall_ > 0.0 &&
+                             (now_s - t_last_lidar1_wall_) > g_lidar2_only_gap;
+  if ((!have1 && !lidar1_outage) || imu_buffer_.empty()) {
     return false;
+  }
+  // (C1) 诊断（每 5 s 一条）：开关开时打印三条件实测值，便于"门控为何不触发"的定位
+  if (g_lidar2_only_enable && now_s - dbg_c1_t_ > 5.0) {
+    dbg_c1_t_ = now_s;
+    LOG(INFO) << YELLOW << " ---> [C1Dbg] have1=" << have1 << " have2=" << have2
+              << " dt_arrival=" << (t_last_lidar1_wall_ > 0.0 ? now_s - t_last_lidar1_wall_ : -1.0)
+              << " dt_datatime=" << (have2 && last_timestamp_lidar_ > 0.0
+                                     ? lidar_buffer_2_.front().end_time - last_timestamp_lidar_ : -1.0)
+              << " gap=" << g_lidar2_only_gap << " last1=" << last_timestamp_lidar_ << RESET;
   }
 
   if (!lidar_pushed_) {
-    meas.lidar = lidar_buffer_.front();
-    meas.has_lidar2 = false;
-    lidar_pushed_ = true;
-  }
-
-  if(last_timestamp_lidar_ > meas.lidar.end_time){
-    lidar_buffer_.pop_front();
-    lidar_pushed_ = false;
-    return false;
-  }
-
-  // ── second LiDAR: retry until matched or IMU ready ──
-  // lidar2 data may arrive after lidar1; keep trying on each poll cycle.
-  if (g_dual_lidar_enable && !meas.has_lidar2 && !lidar_buffer_2_.empty()) {
-    double lidar1_start = meas.lidar.start_time;
-    double lidar1_end   = meas.lidar.end_time;
-    while (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().end_time < lidar1_start) {
-      lidar_buffer_2_.pop_front();
-    }
-    if (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().start_time <= lidar1_end) {
+    if (have1) {
+      meas.lidar = lidar_buffer_.front();
+      meas.has_lidar1 = true;
+      meas.has_lidar2 = false;
+    } else {
+      // 无 lidar1：本组以 lidar2 的时间跨度为基准；meas.lidar 留空，
+      // 下游一律按 has_lidar1 跳过 lidar1 环节（deskew / 建图初始 / SetObsTime）。
+      meas.lidar = LidarData();
+      meas.has_lidar1 = false;
       meas.lidar2 = lidar_buffer_2_.front();
       meas.has_lidar2 = true;
       lidar_buffer_2_.pop_front();
     }
+    lidar_pushed_ = true;
   }
 
-  if (last_timestamp_imu_ < meas.lidar.end_time) {
+  const double grp_end = meas.has_lidar1 ? meas.lidar.end_time : meas.lidar2.end_time;
+
+  if (meas.has_lidar1) {
+    if(last_timestamp_lidar_ > meas.lidar.end_time){
+      lidar_buffer_.pop_front();
+      lidar_pushed_ = false;
+      return false;
+    }
+
+    // ── second LiDAR: retry until matched or IMU ready ──
+    // lidar2 data may arrive after lidar1; keep trying on each poll cycle.
+    if (g_dual_lidar_enable && !meas.has_lidar2 && !lidar_buffer_2_.empty()) {
+      double lidar1_start = meas.lidar.start_time;
+      double lidar1_end   = meas.lidar.end_time;
+      while (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().end_time < lidar1_start) {
+        lidar_buffer_2_.pop_front();
+      }
+      if (!lidar_buffer_2_.empty() && lidar_buffer_2_.front().start_time <= lidar1_end) {
+        meas.lidar2 = lidar_buffer_2_.front();
+        meas.has_lidar2 = true;
+        lidar_buffer_2_.pop_front();
+      }
+    }
+  }
+
+  if (last_timestamp_imu_ < grp_end) {
     return false;
   }
 
   double imu_time = imu_buffer_.front().secs;
   meas.imu.clear();
-  while ((!imu_buffer_.empty()) && (imu_time < meas.lidar.end_time)) {
+  while ((!imu_buffer_.empty()) && (imu_time < grp_end)) {
     imu_time = imu_buffer_.front().secs;
-    if (imu_time > meas.lidar.end_time) break;
+    if (imu_time > grp_end) break;
     meas.imu.push_back(imu_buffer_.front());
     imu_buffer_.pop_front();
   }
 
-  last_timestamp_lidar_ = meas.lidar.end_time;
-  lidar_buffer_.pop_front();
+  if (meas.has_lidar1) {
+    last_timestamp_lidar_ = meas.lidar.end_time;
+    lidar_buffer_.pop_front();
+  }
   lidar_pushed_ = false;
   return true;
 }

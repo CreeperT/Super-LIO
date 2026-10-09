@@ -133,6 +133,7 @@ struct LidarData
 struct MeasureGroup {
   LidarData lidar;
   LidarData lidar2;
+  bool has_lidar1 = true;    // (C1) false = 本组只有 lidar2（lidar1 断流且 lidar2-only 开关打开）
   bool has_lidar2 = false;
   std::deque<IMUData> imu;
 };

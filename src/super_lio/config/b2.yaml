@@ -11,6 +11,7 @@
 
     # ===================== ROS Topic ==============================
     lio.ros.imu_topic: "/dog_imu_raw"        # IMU话题（时间基准）
+    lio.ros.lidar_qos_reliable: false        # (A) 雷达订阅 QoS 与发布端对齐（RELIABLE）；臂里改 true
 
     # ============================================================
     #  LiDAR1 配置 — 两套方案，注释/取消注释来切换

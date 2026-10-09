@@ -81,6 +81,9 @@ namespace LI2Sup{
   bool g_visual_map = true;
   bool g_visual_dense = false;
   int  g_pub_step;
+  bool g_lidar_qos_reliable = false;   // (A) 默认 false = 原 best_effort 行为（开/关零重编）
+  bool g_lidar2_only_enable = false;   // (C1) 默认 false = 原门控（lidar1 单独门控整个更新）
+  double g_lidar2_only_gap = 0.3;      // (C1) 断流门控阈值(s)：lidar1 缺席超过它才放行 lidar2-only 组
   bool g_nav2_tf    = false;
 
   /// for planner
