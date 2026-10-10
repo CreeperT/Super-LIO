@@ -131,10 +131,14 @@ namespace LI2Sup{
   extern double g_edge_line_dist_thresh;   // max distance to fitted line (neighbors & scan point)
   extern double g_edge_linearity_ratio;    // λ_max / λ_2nd > this in fit_line_from_points
   extern double g_high_intensity_edge_boost;  // extra multiplier for high-intensity edge features
+  extern double g_plane_weight;            // point-to-plane (surface) observation weight
 
   /// P lower bound (covariance clamp)
   extern bool   g_p_lower_bound_enabled;  // enable P lower bound clamping
   extern double g_p_lower_bound_trans;    // min σ for position (m), e.g. 0.05 = 5cm
+  // ⚠ min VARIANCE for rotation (rad²) — NOT a σ. Used directly, not squared,
+  // unlike g_p_lower_bound_trans. See the note in params.cpp before changing it.
+  extern double g_p_lower_bound_rot;
 
   /// degeneracy handling
   extern bool   g_degeneracy_enabled;

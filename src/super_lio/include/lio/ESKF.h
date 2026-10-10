@@ -118,6 +118,23 @@ public:
   bool shouldResetMap() const { return reset_map_requested_; }
   void clearResetMapFlag() { reset_map_requested_ = false; }
 
+  // ── P-lower-bound trigger accounting (P1.9) ──────────────────────────────
+  // One record PER CLAMP SITE. The two sites run at different rates —
+  // Predict() at the IMU rate (~200 Hz) and UpdateObserve() at the observation
+  // rate (~10 Hz) — so a single merged counter could not tell "the dose was
+  // ineffective" from "the clamp never fired". Counters are cumulative and are
+  // reported periodically; they are deliberately NOT hung on the min-refresh
+  // log, which by construction can never report a zero-trigger run.
+  struct PLowerBoundStats {
+    long long steps         = 0;  // clamp evaluations at this site
+    long long trans_clamped = 0;  // evaluations that raised >=1 position diagonal
+    long long rot_clamped   = 0;  // evaluations that raised >=1 rotation diagonal
+    long long trans_elems   = 0;  // position diagonals raised, summed
+    long long rot_elems     = 0;  // rotation diagonals raised, summed
+  };
+  const PLowerBoundStats& plbStatsPredict() const { return plb_pred_; }
+  const PLowerBoundStats& plbStatsObserve() const { return plb_obs_; }
+
   void setCalibEnabled(bool en) { calib_enabled_ = en; }
   bool isCalibEnabled() const { return calib_enabled_; }
   void setCalibS0(double s0) { calib_s0_ = s0; }
@@ -135,6 +152,15 @@ private:
   void BuildNoise(const Options& options);
   void Update();
   void RemapDegeneracy(const BASIC::M3& Q_trans, const BASIC::M6& HTVH, STATE& dx);
+
+  // Applies the covariance clamp for one site and updates that site's counters.
+  // Both sites apply the identical two blocks (position 3..5, rotation 0..2) so
+  // their accounting cannot drift apart.
+  void ApplyPLowerBound(PLowerBoundStats& stats);
+  void LogPLowerBoundStats(const char* site, const PLowerBoundStats& stats, long long period);
+
+  PLowerBoundStats plb_pred_;  // Predict() site  (~200 Hz)
+  PLowerBoundStats plb_obs_;   // UpdateObserve() site (~10 Hz)
   
   bool  need_converge_  = true;
   float imu_scale_ = 1.0;

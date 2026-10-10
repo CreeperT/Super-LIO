@@ -31,8 +31,12 @@ namespace LI2Sup{
   float  g_blind2;
   float  g_maxrange2;
   int    g_filter_rate;
-  float  g_intensity_thresh = 200.0f;   // keep all points above this (max ~255)
-  float  g_intensity_weight = 2.0f;     // extra weight factor for high-intensity
+  // Reflectance (retroreflective pole) weighting. These defaults are the SINGLE
+  // SOURCE OF TRUTH: ROSWrapper.cpp passes each global as its declare_parameter
+  // default, so a key missing from b2.yaml falls back to exactly the value below
+  // rather than to a second, silently different number.
+  float  g_intensity_thresh = 80.0f;    // keep all points above this (max ~255)
+  float  g_intensity_weight = 2.5f;     // extra weight factor for high-intensity
   bool   g_enable_downsample;
   float  g_voxel_fliter_size;
   double g_lidar1_time_offset = 0.0;
@@ -94,6 +98,14 @@ namespace LI2Sup{
   /// P lower bound (covariance clamp)
   bool   g_p_lower_bound_enabled = false;
   double g_p_lower_bound_trans = 0.05;  // σ_pos ≥ 5cm
+  // Rotation-side floor. ⚠ SEMANTIC ASYMMETRY, deliberate: `trans` is a σ and the
+  // clamp squares it, while `rot` is used DIRECTLY as the variance floor (rad²).
+  // The default 3.0e-6 reproduces the previously hardcoded literal bit-for-bit;
+  // squaring a σ here would perturb the last bits and break the P1.9 acceptance
+  // test ("默认值下行为逐位不变"). Do not "fix" the asymmetry without re-running
+  // that test. Setting rot_sigma = 0 disables the rotation clamp (P < 0 is never
+  // true; a diagonal that rounds slightly negative is still raised to 0, benign).
+  double g_p_lower_bound_rot = 3.0e-6;
 
   /// online calibration
   bool   g_enable_online_calib = true;
@@ -102,11 +114,20 @@ namespace LI2Sup{
   double g_calib_dt_rw        = 1.0e-6;   // ~1μs/√s
 
   /// edge (point-to-line) feature
+  // Values below are the paper-era effective configuration (b2.yaml@006731d) and
+  // the single source of truth for ROSWrapper's declare_parameter defaults.
+  // Previously these were 100.0 / 0.05 / 5.0, which disagreed with the declared
+  // defaults 500.0 / 0.15 / 3.0 — dead values that could only ever mislead.
   bool   g_enable_edge_feature = true;
-  double g_edge_weight = 100.0;
-  double g_edge_line_dist_thresh = 0.05;
-  double g_edge_linearity_ratio = 5.0;
+  double g_edge_weight = 500.0;
+  double g_edge_line_dist_thresh = 0.15;
+  double g_edge_linearity_ratio = 3.0;
   double g_high_intensity_edge_boost = 3.0;
+
+  /// point-to-plane (surface) feature weight.
+  // Was hardcoded as a literal 1000.0 inside Observe(); now a parameter so the
+  // plane/edge weight ratio is configurable from b2.yaml like every other weight.
+  double g_plane_weight = 1000.0;
 
   /// degeneracy handling
   bool   g_degeneracy_enabled = true;

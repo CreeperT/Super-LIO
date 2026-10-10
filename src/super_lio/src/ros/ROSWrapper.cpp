@@ -89,9 +89,12 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<int>("lio.sensor.filter_rate", 1);
   node.get_parameter("lio.sensor.filter_rate", g_filter_rate);
 
-  node.declare_parameter<double>("lio.sensor.intensity_thresh", 200.0);
+  // Reflectance weighting. Each declare_parameter default is the params.cpp global
+  // itself, so params.cpp is the single source of truth and a key missing from
+  // b2.yaml cannot silently fall back to a second, different number.
+  node.declare_parameter<double>("lio.sensor.intensity_thresh", g_intensity_thresh);
   node.get_parameter("lio.sensor.intensity_thresh", g_intensity_thresh);
-  node.declare_parameter<double>("lio.sensor.intensity_weight", 2.0);
+  node.declare_parameter<double>("lio.sensor.intensity_weight", g_intensity_weight);
   node.get_parameter("lio.sensor.intensity_weight", g_intensity_weight);
 
   node.declare_parameter<bool>("lio.sensor.enable_downsample", false);
@@ -338,27 +341,40 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.get_parameter("lio.calib.dt_rw", g_calib_dt_rw);
 
   // ================= edge features (point-to-line) =================
-  node.declare_parameter<bool>("lio.feature.enable_edge", true);
+  // Defaults come from params.cpp (single source of truth); b2.yaml overrides them.
+  node.declare_parameter<bool>("lio.feature.enable_edge", g_enable_edge_feature);
   node.get_parameter("lio.feature.enable_edge", g_enable_edge_feature);
 
-  node.declare_parameter<double>("lio.feature.edge_weight", 500.0);
+  node.declare_parameter<double>("lio.feature.edge_weight", g_edge_weight);
   node.get_parameter("lio.feature.edge_weight", g_edge_weight);
 
-  node.declare_parameter<double>("lio.feature.edge_line_dist_thresh", 0.15);
+  node.declare_parameter<double>("lio.feature.edge_line_dist_thresh", g_edge_line_dist_thresh);
   node.get_parameter("lio.feature.edge_line_dist_thresh", g_edge_line_dist_thresh);
 
-  node.declare_parameter<double>("lio.feature.edge_linearity_ratio", 3.0);
+  node.declare_parameter<double>("lio.feature.edge_linearity_ratio", g_edge_linearity_ratio);
   node.get_parameter("lio.feature.edge_linearity_ratio", g_edge_linearity_ratio);
 
-  node.declare_parameter<double>("lio.feature.high_intensity_edge_boost", 3.0);
+  node.declare_parameter<double>("lio.feature.high_intensity_edge_boost", g_high_intensity_edge_boost);
   node.get_parameter("lio.feature.high_intensity_edge_boost", g_high_intensity_edge_boost);
 
+  // ================= point-to-plane (surface) weight =================
+  // Was a literal 1000.0 inside Observe(); exposed so the plane/edge weight ratio
+  // is configurable from b2.yaml like every other observation weight.
+  node.declare_parameter<double>("lio.feature.plane_weight", g_plane_weight);
+  node.get_parameter("lio.feature.plane_weight", g_plane_weight);
+
   // ================= P lower bound (covariance clamp) =================
-  node.declare_parameter<bool>("lio.kf.p_lower_bound.enabled", false);
+  node.declare_parameter<bool>("lio.kf.p_lower_bound.enabled", g_p_lower_bound_enabled);
   node.get_parameter("lio.kf.p_lower_bound.enabled", g_p_lower_bound_enabled);
 
-  node.declare_parameter<double>("lio.kf.p_lower_bound.trans_sigma", 0.05);
+  node.declare_parameter<double>("lio.kf.p_lower_bound.trans_sigma", g_p_lower_bound_trans);
   node.get_parameter("lio.kf.p_lower_bound.trans_sigma", g_p_lower_bound_trans);
+
+  // ⚠ This is a VARIANCE floor (rad²), not a σ: it is applied directly, whereas
+  // trans_sigma above is squared. Default 3.0e-6 reproduces the previously
+  // hardcoded literal. rot_sigma = 0 disables the rotation clamp.
+  node.declare_parameter<double>("lio.kf.p_lower_bound.rot_sigma", g_p_lower_bound_rot);
+  node.get_parameter("lio.kf.p_lower_bound.rot_sigma", g_p_lower_bound_rot);
 
   // ================= degeneracy handling =================
   node.declare_parameter<bool>("lio.degeneracy.enabled", true);

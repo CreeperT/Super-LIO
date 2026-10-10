@@ -1084,7 +1084,7 @@ void SuperLIO::Observe(){
               J_pose.head<3>() = point_body_d.cross(nb);
               J_pose.tail<3>() = normvec;
 
-              double w = 1000.0 * _weights[idx];
+              double w = g_plane_weight * _weights[idx];
               local_acc.HTVH += J_pose * w * J_pose.transpose();
               local_acc.HTVr -= J_pose * w * error;
               local_acc.plane_pts.push_back(point_world);

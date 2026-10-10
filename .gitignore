@@ -7,3 +7,17 @@ install
 .catkin_workspace
 .catkin_tools
 src/CMakeLists.txt
+# ── 运行产出（数据，勿入库；已在库里的文件不受影响）─────────────
+src/super_lio/logs/*.csv
+exp_repeat/
+exp_controlled/
+exp_pose_dc/
+.ros_log/
+
+# ── 大体积存档与二进制证据（勿入库）────────────────────────────
+# archive/ 下是历史诊断转储（stale_logs_20261009 约 1.4 GB），仅作本地存档；
+# 入库会让 git 历史膨胀且无法回收。见 archive/stale_logs_20261009/README.md。
+archive/
+# 验证用的二进制实体（每个 ~3.5 MB）。它们可由 git 源码重建，
+# 配方见 docs/P0/plb_ab/README.md §1，故不入库。
+docs/P0/plb_ab/bin/

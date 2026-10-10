@@ -11,7 +11,9 @@
 
     # ===================== ROS Topic ==============================
     lio.ros.imu_topic: "/dog_imu_raw"        # IMU话题（时间基准）
-    lio.ros.lidar_qos_reliable: false        # (A) 雷达订阅 QoS 与发布端对齐（RELIABLE）；臂里改 true
+    lio.ros.lidar_qos_reliable: true         # (A) 雷达订阅 QoS 与发布端对齐（RELIABLE）
+                                             # 基准值（P0.5, 2026-10-10）：true。论文后唯一输入链修复，
+                                             # 只提升成功率、不改变数值 ⇒ 与论文表 I 同源。
 
     # ============================================================
     #  LiDAR1 配置 — 两套方案，注释/取消注释来切换
@@ -23,7 +25,6 @@
     lio.sensor.blind: 1.0                # 盲区距离(m)
     lio.sensor.maxrange: 150.0           # 最大有效距离(m)
     lio.sensor.filter_rate: 3            # 降采样率：每隔N个点取1个
-    lio.sensor.time_offset: 0.0          # 速腾不需要时钟修正
     lio.extrinsic.lidar_imu: [0.34218, 0.0, 0.17851,    # 速腾外参（正确）
                               1.0, 0.0, 0.0,
                               0.0, 1.0, 0.0,
@@ -119,6 +120,13 @@
     # ---- P 下界（协方差钳制）----
     lio.kf.p_lower_bound.enabled: false   # 启用位置协方差下界 (σ_pos ≥ trans_sigma)
     lio.kf.p_lower_bound.trans_sigma: 0.05  # 位置标准差下界(m)，默认5cm
+    # ⚠ rot_sigma 是「方差下界(rad²)」而非标准差：代码直接使用该值，不做平方；
+    #    而 trans_sigma 是 σ、代码会平方。默认 3.0e-6 与旧硬编码字面量逐位一致。
+    #    改语义前必须重跑 P1.9 的逐位等价测试。
+    # ⚠⚠ 关闭旋转侧必须写 **0.0**，不能写 0：该键声明为 double，YAML 的 `0` 是整数，
+    #    ROS2 会抛 InvalidParameterTypeException 并**直接终止节点**（已实测崩溃）。
+    #    剂量档（P1.5）一律写成 0.0 / 0.01 / 0.05 / 0.10。
+    lio.kf.p_lower_bound.rot_sigma: 3.0e-6  # 旋转方差下界(rad²)，0.0=关闭旋转侧钳制
 
     # ===================== 输出 ==================================
     lio.output.robot: false              # 发布机器人坐标系odom (/mavros/vision_pose)
@@ -164,13 +172,16 @@
 
     # ===================== 点-线边缘特征 =========================
     lio.feature.enable_edge: true           # 启用边缘特征
-    lio.feature.edge_weight: 500.0          # 边缘观测权重（平面=1000）
+    lio.feature.edge_weight: 500.0          # 边缘观测权重
+    lio.feature.plane_weight: 1000.0        # 点-面（平面）观测权重；原为 Observe() 内的字面量 1000.0
     lio.feature.edge_line_dist_thresh: 0.15 # 邻居点/扫描点到拟合线最大距离(m)，越小越严格
     lio.feature.edge_linearity_ratio: 3.0   # λmax/λ2nd > 此值→线结构（fit_line_from_points内）
     lio.feature.high_intensity_edge_boost: 3.0  # 高强点线特征额外倍数（反光柱纵向约束）
 
     # ===================== 在线标定 (Phase 1) ====================
-    lio.calib.enable_online_calib: false     # 启用在线外参+时偏估计
+    lio.calib.enable_online_calib: true      # 启用在线外参+时偏估计
+                                             # 基准值（P0.5, 2026-10-10）：true。论文参考轨迹即 calib ON
+                                             # （b2.yaml@006731d 该键即为 true）。
     lio.calib.ext_rot_rw: 1.7e-4            # 外参旋转随机游走(rad/√s) ≈0.01°/√s
     lio.calib.ext_trans_rw: 1.0e-4          # 外参平移随机游走(m/√s) ≈0.1mm/√s
     lio.calib.dt_rw: 1.0e-6                 # 时间偏移随机游走(s/√s) ≈1μs/√s
@@ -187,8 +198,13 @@
     # 地面法向的绝对朝向就是地形本身（本场地实测横向坡度达 ±5°），故只约束"沿行进方向"的
     # 纵向分量，横向坡度原样保留。此六键必须**存在**：run_graft_n.sh 的 set_yaml 只替换已存在
     # 的行、不新增，缺键时旧版会静默 no-op（见 CHANGELOG 续 17）。
-    lio.structure.wall_enabled: true        # 墙吸附竖直 → roll（代码默认 false）
-    lio.structure.ground_enabled: true      # 地面纵向约束 → pitch（代码默认 false）
+    lio.structure.wall_enabled: false       # 墙吸附竖直 → roll（代码默认 false）
+    lio.structure.ground_enabled: false     # 地面纵向约束 → pitch（代码默认 false）
+    # 基准值（P0.5, 2026-10-10）：两者均 false —— 本通道 2026-09-22（提交 5cc13f7）才加入，
+    # 论文数据全部跑于 09-13～09-15，故论文基准中根本不存在该通道；取 false 才是同源。
+    # 作用域订正：本通道在 RELOC 模式下同样生效（SuperLIOReLoc 继承非虚 Observe()），
+    # 并非 SLAM 专属 ⇒ 任何启用它的消融必须跑在 RELOC 模式，且构成新配置代际。
+    # 启用时不得沿用下面的站点常数 0.566°（5#GJD 专有），须改用 auto 或实测坡度。
     lio.structure.ground_grade_auto: false   # 初始化静止段自动捕获地形法向作为参考
     lio.structure.ground_grade_deg: 0.566     # 手动参考纵向坡度（auto=false 时生效，°）
     # 权重与 LiDAR 姿态块同量纲（实测 H_pose 旋转块对角 4.4e5/1.85e7/3.09e7）：

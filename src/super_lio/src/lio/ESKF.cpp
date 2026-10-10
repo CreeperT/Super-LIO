@@ -332,6 +332,48 @@ bool ESKF::Predict(const IMUData& imu, DynamicState& state_imu, DynamicState& st
 }
 
 
+// ── P lower bound: one implementation shared by both clamp sites (P1.9) ───────
+// The two call sites previously carried the same clamp duplicated, with the
+// rotation floor hardcoded as a literal in both. Sharing the body removes that
+// duplication and guarantees the trigger accounting matches the arithmetic.
+//
+// ⚠ SEMANTIC ASYMMETRY (deliberate): `g_p_lower_bound_trans` is a σ and is
+// squared here; `g_p_lower_bound_rot` is already a VARIANCE and is used directly.
+// With the default 3.0e-6 this reproduces the old hardcoded literal bit-for-bit —
+// squaring a σ would perturb the low bits and break the P1.9 acceptance test.
+void ESKF::ApplyPLowerBound(PLowerBoundStats& stats) {
+  stats.steps++;
+  if (!g_p_lower_bound_enabled) return;
+
+  const scalar p_min_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
+  const scalar p_min_rot   = scalar(g_p_lower_bound_rot);
+
+  int n_trans = 0;
+  for (int i = 3; i < 6; i++) {
+    if (P_(i, i) < p_min_trans) { P_(i, i) = p_min_trans; n_trans++; }
+  }
+  int n_rot = 0;
+  for (int i = 0; i < 3; i++) {
+    if (P_(i, i) < p_min_rot) { P_(i, i) = p_min_rot; n_rot++; }
+  }
+
+  if (n_trans) { stats.trans_clamped++; stats.trans_elems += n_trans; }
+  if (n_rot)   { stats.rot_clamped++;   stats.rot_elems   += n_rot; }
+}
+
+// Periodic, cumulative, per-site. Deliberately NOT attached to the min-refresh
+// log: a run in which the clamp never fires produces no min refresh at all, so
+// that route could never distinguish "dose ineffective" from "never triggered".
+void ESKF::LogPLowerBoundStats(const char* site, const PLowerBoundStats& s, long long period) {
+  if (!(s.steps <= 5 || (period > 0 && s.steps % period == 0))) return;
+  LOG(INFO) << "[P_lb#" << site << "] step=" << s.steps
+            << " | trans " << s.trans_clamped << "/" << s.steps << " steps, "
+            << s.trans_elems << " elems (floor σ=" << g_p_lower_bound_trans << "m)"
+            << " | rot " << s.rot_clamped << "/" << s.steps << " steps, "
+            << s.rot_elems << " elems (floor var=" << g_p_lower_bound_rot << "rad²)";
+}
+
+
 bool ESKF::Predict(const IMUData& imu) {
 
   if(last_imu_time_ < 0){
@@ -400,17 +442,11 @@ bool ESKF::Predict(const IMUData& imu) {
     P_(31, 31) += dt_rw * dt_rw;
   }
 
-  // P lower bounds (configurable via params)
-  if (g_p_lower_bound_enabled) {
-    scalar p_min_pred_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
-    scalar p_min_pred_rot   = scalar(3.0e-6);
-    for (int i = 3; i < 6; i++) {
-      if (P_(i, i) < p_min_pred_trans) P_(i, i) = p_min_pred_trans;
-    }
-    for (int i = 0; i < 3; i++) {
-      if (P_(i, i) < p_min_pred_rot) P_(i, i) = p_min_pred_rot;
-    }
-  }
+  // P lower bounds (configurable via params) — clamp site A: IMU rate (~200 Hz).
+  // Kept as a shared method so this site and the UpdateObserve site cannot drift
+  // apart in either the arithmetic or the trigger accounting.
+  ApplyPLowerBound(plb_pred_);
+  if (g_p_lower_bound_enabled) LogPLowerBoundStats("Predict", plb_pred_, 2000);
 
   global_acc_ = R_.R() * acc + g_;
   p_ = p_ + v_ * dt + 0.5 * global_acc_ * dt * dt;
@@ -649,28 +685,29 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   P_ = Pk;
 
-  // P lower bounds (configurable via params)
+  // P lower bounds (configurable via params) — clamp site B: observation rate (~10 Hz).
   if (g_verbose_logging) {
     scalar cur_trans_sigma = scalar(std::sqrt(std::max(scalar(0),
         (P_(3,3) + P_(4,4) + P_(5,5)) / scalar(3))));
+    scalar cur_rot_sigma = scalar(std::sqrt(std::max(scalar(0),
+        (P_(0,0) + P_(1,1) + P_(2,2)) / scalar(3))));
     static scalar min_trans_sigma_seen = cur_trans_sigma;
+    static scalar min_rot_sigma_seen   = cur_rot_sigma;
     if (cur_trans_sigma < min_trans_sigma_seen) {
       min_trans_sigma_seen = cur_trans_sigma;
       LOG(INFO) << "[P_lb] new min σ_trans=" << min_trans_sigma_seen
                 << "m (lb=" << g_p_lower_bound_trans << "m, "
                 << (g_p_lower_bound_enabled ? "ON" : "OFF") << ")";
     }
-  }
-  if (g_p_lower_bound_enabled) {
-    scalar p_min_trans = scalar(g_p_lower_bound_trans * g_p_lower_bound_trans);
-    scalar p_min_rot   = scalar(3.0e-6);
-    for (int i = 3; i < 6; i++) {
-      if (P_(i, i) < p_min_trans) P_(i, i) = p_min_trans;
-    }
-    for (int i = 0; i < 3; i++) {
-      if (P_(i, i) < p_min_rot) P_(i, i) = p_min_rot;
+    if (cur_rot_sigma < min_rot_sigma_seen) {
+      min_rot_sigma_seen = cur_rot_sigma;
+      LOG(INFO) << "[P_lb] new min σ_rot=" << min_rot_sigma_seen
+                << "rad (floor var=" << g_p_lower_bound_rot << "rad², "
+                << (g_p_lower_bound_enabled ? "ON" : "OFF") << ")";
     }
   }
+  ApplyPLowerBound(plb_obs_);
+  if (g_p_lower_bound_enabled) LogPLowerBoundStats("Observe", plb_obs_, 200);
 
   dx_.setZero();
 
