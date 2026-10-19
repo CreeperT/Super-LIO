@@ -122,7 +122,7 @@ bool SuperLIOReLoc::map_init(){
   static bool pcd_loaded = false;
   if(pcd_loaded) return true;
 
-  std::string map_name = g_save_map_dir + "/" + g_map_name;
+  std::string map_name = ((g_map_name.size() && g_map_name[0] == '/') ? g_map_name : (g_save_map_dir + "/" + g_map_name));
   if(pcl::io::loadPCDFile<PointType>(map_name, *point_map_) == -1){
     LOG(ERROR) << RED << " ---> Load map failed. File: " << map_name << RESET;
     return false;
@@ -544,6 +544,10 @@ bool SuperLIOReLoc::kf_init(){
   state.p = init_guess_T.block<3, 1>(0, 3);
   state.bg = mean_gyro;
   state.ba = estimated_ba;
+  // ★ 2026-10-19: 必须显式清零速度。上面 GetSysState() 拿的是 init 阻塞期间 IMU 回调
+  //   已经 Predict 过的状态, 其 v 是未初始化/垃圾值(~几十 m/s); 不清零则 KF init 后的
+  //   第一次传播就把位姿甩出地图(knn_valid=0, 位移发散)。init 门槛已保证机器人静止。
+  state.v = V3::Zero();
   state.timestamp = measures_.imu.back().secs;
   kf_->SetX(state);
   sys_init_pose_ = kf_->GetSE3();

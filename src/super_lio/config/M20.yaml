@@ -1,0 +1,172 @@
+/**:
+  ros__parameters:
+    # =====================================================================
+    #  M20.yaml — 山猫 M20 (RoboSense RS-Airy 96线, 外接 Jetson AGX Orin)
+    #  模板来源: b2.yaml @ 00eb080。与 b2 的差异只在"平台/输入链"这几项,
+    #  其余控制/权重/阈值键原样照抄, 以保证与 B2 实验口径可比。
+    # =====================================================================
+
+    # ===================== Map ====================================
+    lio.map.save_map: false                # ★ M20 建图用(b2 消融基线为 false)
+    lio.map.if_filter: true               # 保存时体素滤波
+    lio.map.save_map_dir: "/home/ysc/Nav_ws/src/Super-LIO/src/super_lio/map"   # ★ 绝对路径 (2026-10-19: 代码已支持绝对 save_map_dir)
+    lio.map.map_name: "/mnt/nvme/map/4F.pcd"
+    lio.map.ds_size: 0.2
+    lio.map.save_interval: 200
+
+    # ===================== ROS Topic ==============================
+    lio.ros.imu_topic: "/IMU"             # ★ yesense 200 Hz, 已对齐 base_link
+    lio.ros.lidar_qos_reliable: true      # ★ 发布端 offered=RELIABLE; 订成 best_effort 会静默丢包
+
+    # ---- LiDAR1: 前雷达(外接 rslidar_sdk) ----
+    lio.ros.lidar_topic: "/rslidar_points"   # ★ 2026-10-19: 改用 m20_lidar_merge 合并云 (frame=rslidar, 点已在 base_link)
+    #   点字段(x,y,z,intensity,ring,timestamp)与 hesai_ros::Point 逐字段同构,
+    #   且实现只取点内时间戳的**差值**, 对"整体带常数偏移"免疫。
+    lio.sensor.lidar_type: 2
+    lio.sensor.blind: 0.5                 # 雷达最小量程 0.2 m; 0.5 已含机身遮挡
+    lio.sensor.maxrange: 60.0             # 雷达规格 0.2–60 m
+    lio.sensor.filter_rate: 2             # 86400 点/帧 => 抽稀到 ~17k; 看 eva.timer 的 [Undistort] 耗时调
+    lio.sensor.enable_downsample: true
+    lio.sensor.voxel_fliter_size: 0.3
+    lio.sensor.gravity_norm: 9.7946
+    lio.sensor.imu_type: 1
+
+    # =====================================================================
+    # ★★★ 跨机时钟差 —— 本配置最脆弱的一项, 每次上电必须重测 ★★★
+    #   雷达点云 = Jetson 本机时钟(rslidar_sdk use_lidar_clock: false)
+    #   /IMU     = 机器人时钟 = Jetson + 14.077 s(NOS 未做时间同步, 会缓慢漂)
+    #   本分支没有 imu 侧偏移键, 只能改 LiDAR 侧: time_offset = imu_clock - lidar_clock
+    #   重测: 静止时两端各订阅一次, 比较 header 与本机 wall clock(IMU 端 header-wall 即所需值)
+    #   结构性修法(推荐, 取代手工常数): 让两机同源 —— NOS/AOS 装 chrony/NTP, 或让 Jetson 做时间源
+    # =====================================================================
+    lio.sensor.time_offset: 0.1277        # ★ 物理传感器延迟(PTP 实测: 合并云 header 比墙钟早 129.2 ms); 必须为正, 否则 IMU 窗口塌成 1 样本
+
+    # ---- IMU 噪声(ESKF 过程噪声 Q) ----
+    lio.sensor.imu_na: 0.1
+    lio.sensor.imu_ng: 0.1
+    lio.sensor.imu_nba: 0.001
+    lio.sensor.imu_nbg: 0.0005
+
+    # ---- 强度滤波(反光柱辅助定位) ----
+    lio.sensor.intensity_thresh: 80.0     # ⚠ M20 强度量纲未核, 暂沿用 B2 值
+    lio.sensor.intensity_weight: 2.5
+
+    # =====================================================================
+    #  外参 ★★★ 2026-10-13 更正: 雷达轴与 base_link **并不对齐** ★★★
+    #  依据: 机器人驱动 /opt/robot/share/node_driver/config/config.yaml 的实装角
+    #    前雷达 roll 0 / pitch -1.57079 / yaw -3.14159  => R = Rz(-180)·Ry(-90)
+    #    后雷达 roll 0 / pitch -1.57079 / yaw  0        => R = Ry(-90)
+    #  外接 rslidar_sdk 输出的是**原始雷达坐标系**, 必须按上述旋转才能进 IMU 域。
+    #  把旋转误写成单位矩阵的后果: 静止建图看似正常(恒定旋转自洽), 一转动即发散。
+    # =====================================================================
+    # 前雷达→IMU = p_lidar - p_imu = (0.25708, 0.0268, 0.0305)
+    lio.extrinsic.lidar_imu: [
+                              -0.0632, 0.0268, 0.0435,
+                              1.0, 0.0, 0.0,
+                              0.0, 1.0, 0.0,
+                              0.0, 0.0, 1.0]   # ★ 合并云链(点已在 base_link): rslidar->imu, 旋转=单位阵
+    lio.extrinsic.odom_robo: [0.0632, -0.0268, -0.0435, 0.0, 0.0, 0.0]   # IMU 在 base_link 下的位置
+
+    # ---- LiDAR2: 后雷达 ----
+    lio.lidar2.enable: false               # ★ 2026-10-19: 前后融合已由外部 m20_lidar_merge 承担
+    lio.lidar2.lidar_type: 2              # ★ 与 LiDAR1 同型
+    lio.lidar2.lidar_topic: "/rslidar_points_rear"
+    lio.lidar2.blind: 0.5
+    lio.lidar2.maxrange: 60.0
+    lio.lidar2.filter_rate: 2
+    lio.lidar2.weight: 1.0                # 观测权重(相对雷达1)
+    # 两雷达同源(同一个 rslidar_sdk / 同一台 Jetson)。开动态补偿反而会把 lidar2 留在 Jetson
+    # 时钟域而与 lidar1 差 14.077 s => 关掉, 走与 lidar1 相同规则(offset = 0.0 + 14.077)。
+    lio.lidar2.time_offset: 0.0
+    lio.lidar2.use_dynamic_offset: false
+    # 后雷达→IMU = (-0.32028-0.0632, 0.0268, 0.0305)
+    lio.lidar2.extrinsic_imu: [
+                              -0.38348, 0.0268, 0.0305,
+                              0.0, 0.0, -1.0,
+                              0.0, 1.0, 0.0,
+                              1.0, 0.0, 0.0]
+
+    # ===================== 地图(OctVoxMap)========================
+    lio.hash_map.hash_capacity: 100000000
+    lio.hash_map.vox_resolution: 0.5
+
+    # ===================== Kalman Filter =========================
+    lio.kf.kf_type: 0
+    lio.kf.kf_max_iterations: 6
+    lio.kf.kf_align_gravity: true
+    lio.kf.kf_quit_eps: 0.0001
+    lio.kf.p_lower_bound.enabled: true
+    lio.kf.p_lower_bound.trans_sigma: 0.05
+    # ⚠ rot_sigma 是「方差下界(rad²)」, 代码直接使用不做平方; trans_sigma 是 σ 且会被平方。
+    # ⚠⚠ 关闭旋转侧必须写 0.0 不能写 0: 该键声明为 double, YAML 的 0 是整数,
+    #    ROS2 抛 InvalidParameterTypeException 并**直接终止节点**(已实测崩溃)。
+    lio.kf.p_lower_bound.rot_sigma: 3.0e-6
+
+    # ===================== 输出 ==================================
+    lio.output.robot: false
+    lio.output.plan_env_world: false
+    lio.output.plan_env_body: false
+    lio.output.planner: false
+    lio.output.map: true
+    lio.output.dense: true
+    lio.output.pub_step: 5
+    lio.output.nav2_tf: false
+
+    # ===================== 性能评估 ==============================
+    lio.eva.timer: true                   # ★ 首次跑 M20 必开, 用来定 filter_rate
+    lio.eva.verbose_logging: true
+    lio.eva.decouple_verify: false
+
+    # ===================== 重定位 ================================
+    # ⚠ 本节只对 relocation_node 生效, 建图节点不用。首次重定位时用 marker 手柄填 init_pose。
+    lio.relocation.update_map: false
+    # lio.relocation.init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    lio.relocation.enable_multi_res: true
+    lio.relocation.target_ds_size: 0.5
+    lio.relocation.ndt_resolution: 1.0
+    lio.relocation.icp_max_corr: 8.0
+    lio.relocation.icp_max_iter: 40
+    lio.relocation.fitness_thresh: 1.5
+    lio.relocation.multi_yaw_search: true
+    lio.relocation.yaw_step_deg: 30.0
+    lio.relocation.yaw_search_count: 6
+    lio.relocation.coarse_ds_size: 1.5
+    lio.relocation.coarse_ndt_resolution: 5.0
+    lio.relocation.medium_ds_size: 0.8
+    lio.relocation.medium_ndt_resolution: 2.0
+    lio.relocation.init_frames: 3
+    lio.relocation.z_search_range: 2.0
+    lio.relocation.z_search_step: 1.0
+    lio.relocation.min_overlap_ratio: 0.3
+
+    # ===================== 点-线边缘特征 =========================
+    # ⚠ 现场若出现"退化误判", 优先关掉本通道(edge 假阳性会污染退化检测)。
+    lio.feature.enable_edge: true
+    lio.feature.edge_weight: 500.0
+    lio.feature.plane_weight: 1000.0
+    lio.feature.edge_line_dist_thresh: 0.15
+    lio.feature.edge_linearity_ratio: 3.0
+    lio.feature.high_intensity_edge_boost: 3.0
+
+    # ===================== 在线标定 (Phase 1) ====================
+    # ⚠ 前提: 初始外参与 time_offset 必须**大致正确**。δt 是"残差"状态(dt_rw = 1e-6),
+    #   只能吃毫秒级量, 补不了十几秒的跨机时钟差。
+    lio.calib.enable_online_calib: true
+    lio.calib.ext_rot_rw: 1.7e-4
+    lio.calib.ext_trans_rw: 1.0e-4
+    lio.calib.dt_rw: 1.0e-6
+
+    # ===================== 退化检测 ==============================
+    lio.degeneracy.enabled: false
+    lio.degeneracy.max_stddev: 0.25
+    lio.degeneracy.htvh_cond_thresh: 30.0
+
+    # ===================== 结构正则性(两个独立通道)================
+    # ⚠ ground_grade_deg: 0.566 是 **5#GJD 场地的实测纵向坡度**, 与 M20 场地无关。
+    #   启用前必须: ① 换成 M20 场地的外部实测值(或 auto); ② 在 RELOC 模式下跑。
+    lio.structure.wall_enabled: false
+    lio.structure.ground_enabled: false
+    lio.structure.ground_grade_auto: false
+    lio.structure.ground_grade_deg: 0.566     # ← 5#GJD 专有常数, 勿在 M20 场地直接启用
+    lio.structure.ground_weight: 1.0e7
+    lio.structure.max_angle_deg: 20.0

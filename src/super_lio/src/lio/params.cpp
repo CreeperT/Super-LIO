@@ -36,6 +36,10 @@ namespace LI2Sup{
   bool   g_enable_downsample;
   float  g_voxel_fliter_size;
   double g_lidar1_time_offset = 0.0;
+double g_drop_long_frames_ms = 0.0;
+bool   g_use_true_time_window = false;   // P0-4(d), opt-in
+int    g_deskew_mode = 0;                 // P0-5, 0 = normal deskew
+  double g_lidar1_scan_period = 0.1;   // 10 Hz default; 0 disables azimuth-based deskew
 
   /// second LiDAR (dual-LiDAR fusion)
   bool   g_dual_lidar_enable = false;
@@ -47,6 +51,8 @@ namespace LI2Sup{
   int    g_filter_rate_2 = 3;
   double g_lidar2_weight = 1.0;
   double g_lidar2_time_offset = 0.0;
+  bool   g_lidar2_use_dynamic_offset = true;   // 默认 true = 与改造前逐位一致(B2 不受影响)
+  double g_lidar2_scan_period = 0.1;   // 0 disables azimuth-based deskew
 
   int    g_imu_type;
   double g_gravity_norm = 9.7946;
@@ -58,6 +64,13 @@ namespace LI2Sup{
   SE3 g_lidar_imu;
   SE3 g_odom_robo;
   M3  g_lidar_robo_yaw;
+
+  /// ROS frame ids (overridable via lio.frame.*)
+  std::string g_frame_world = "world";
+  std::string g_frame_imu   = "dog_imu_link";
+  std::string g_frame_map   = "map";
+  std::string g_frame_odom  = "odom";
+  std::string g_frame_base  = "base_link";
 
   /// hash_map
   std::size_t g_ivox_capacity = 100000;

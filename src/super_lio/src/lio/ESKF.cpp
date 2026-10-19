@@ -2,6 +2,8 @@
 #include "basic/logs.h"
 #include <fstream>
 #include <chrono>   // 解算耗时埋点（论文表 VII：联合 32³ vs 解耦 18³+14³）
+#include <cstdlib>
+#include <cmath>
 
 using namespace BASIC;
 
@@ -259,14 +261,85 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
 
 
 void ESKF::Update() {
+  // ── M20 T2' intervention knobs (entry 62) ───────────────────────────────
+  // Read ONCE from the environment so one build serves every arm and level.
+  //   M20_BG_CLAMP B   arm A: clamp |bg_z| to B rad/s (z axis only; 0 = off)
+  //   M20_BG_GATE  G   arm B: reject this frame's bg update if |dz_bg| > G
+  //                    (per-frame gross-error gate; 0 = off)
+  //   M20_BG_LEAK  L   arm D: exponential leak of bg at L per second (0 = off)
+  static const double m20_clamp =
+      [] { const char* v = std::getenv("M20_BG_CLAMP"); return v ? std::atof(v) : 0.0; }();
+  static const double m20_gate =
+      [] { const char* v = std::getenv("M20_BG_GATE"); return v ? std::atof(v) : 0.0; }();
+  static const double m20_leak =
+      [] { const char* v = std::getenv("M20_BG_LEAK"); return v ? std::atof(v) : 0.0; }();
+  static double m20_t_prev = -1.0;
+  static long m20_rejected = 0, m20_seen = 0;
+
+  // ── M20 entry 73: dx_(2) -> WORLD yaw mapping, per iteration ─────────────
+  // Pure logging.  dyaw_world vs dx2 decides whether the applied yaw is
+  // faithfully represented by the tap's body-frame column.
+  const double m20_yaw_b =
+      std::atan2(static_cast<double>(R_.R_(1, 0)), static_cast<double>(R_.R_(0, 0)));
+  const double m20_tilt =
+      std::acos(std::min(1.0, std::max(-1.0, static_cast<double>(R_.R_(2, 2)))));
   R_ = R_ * SO3::Exp(dx_.template block<3, 1>(0, 0));
+  const double m20_yaw_a =
+      std::atan2(static_cast<double>(R_.R_(1, 0)), static_cast<double>(R_.R_(0, 0)));
+  {
+    static std::FILE* m20_upd = nullptr;
+    if (!m20_upd) {
+      m20_upd = std::fopen("/tmp/m20_upd.csv", "w");
+      if (m20_upd) {
+        std::fprintf(m20_upd, "t,dx0,dx1,dx2,yaw_b,yaw_a,dyaw_world,tilt,bgz\n");
+        std::fflush(m20_upd);
+      }
+    }
+    if (m20_upd) {
+      double d = m20_yaw_a - m20_yaw_b;
+      while (d > M_PI) d -= 2.0 * M_PI;
+      while (d < -M_PI) d += 2.0 * M_PI;
+      std::fprintf(m20_upd,
+          "%.6f,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+          current_time_, static_cast<double>(dx_(0)), static_cast<double>(dx_(1)),
+          static_cast<double>(dx_(2)), m20_yaw_b, m20_yaw_a, d, m20_tilt,
+          static_cast<double>(bg_(2)));
+    }
+  }
   p_ += dx_.template block<3, 1>(3, 0);
   v_ += dx_.template block<3, 1>(6, 0);
 
   // Freeze bg/ba during degeneracy — unobservable directions only contain noise
   if (!degen_detected_) {
-    bg_ += dx_.template block<3, 1>(9, 0);
+    ++m20_seen;
+    bool m20_allow = true;
+    if (m20_gate > 0.0 && std::fabs(static_cast<double>(dx_(11))) > m20_gate) {
+      m20_allow = false;          // arm B: this frame's bias step is a gross error
+      ++m20_rejected;
+    }
+    if (m20_allow) {
+      bg_ += dx_.template block<3, 1>(9, 0);
+    }
     ba_ += dx_.template block<3, 1>(12, 0);
+  }
+  if (m20_clamp > 0.0) {          // arm A: z axis only, roll/pitch untouched
+    if (bg_(2) >  static_cast<scalar>(m20_clamp)) bg_(2) =  static_cast<scalar>(m20_clamp);
+    if (bg_(2) < -static_cast<scalar>(m20_clamp)) bg_(2) = -static_cast<scalar>(m20_clamp);
+  }
+  if (m20_leak > 0.0) {           // arm D: mean reversion of the bias state
+    if (m20_t_prev > 0.0) {
+      const double d = current_time_ - m20_t_prev;
+      if (d > 0.0 && d < 1.0) bg_ *= static_cast<scalar>(std::exp(-m20_leak * d));
+    }
+    m20_t_prev = current_time_;
+  }
+  {
+    static int m20_rep = 0;
+    if (m20_rep < 3 || (++m20_rep % 500) == 0) {
+      LOG(INFO) << "[M20BG] clamp=" << m20_clamp << " gate=" << m20_gate
+                << " leak=" << m20_leak << " rejected=" << m20_rejected
+                << "/" << m20_seen << " bg_z=" << bg_(2) << " t=" << current_time_;
+    }
   }
 
   g_ += dx_.template block<3, 1>(15, 0);
@@ -274,6 +347,19 @@ void ESKF::Update() {
 
   // Calibration update is handled separately in UpdateObserve (block-diagonal)
 
+  dbg_dR_z = dx_.template block<3, 1>(0, 0)(2);   // UNGATED: one sample per iteration
+  // ── M20 旋转发散排查临时诊断 (2026-10-12) ────────────────────────────────
+  // ① bg_z 涨到 ≈ ω_z  => 陀螺零偏把转速吸收掉了
+  // ② dR ≈ -ω·dt(反向) => 观测修正在对抗陀螺
+  {
+    static int bias_dbg = 0;
+    if (++bias_dbg <= 5 || bias_dbg % 2 == 0) {
+      LOG(INFO) << "[Bias#" << bias_dbg << "] bg=[" << bg_(0) << "," << bg_(1) << "," << bg_(2)
+                << "] dR=[" << dx_.template block<3, 1>(0, 0)(0) << "," << dx_.template block<3, 1>(0, 0)(1)
+                << "," << dx_.template block<3, 1>(0, 0)(2)
+                << "] w=[" << body_omega_(0) << "," << body_omega_(1) << "," << body_omega_(2) << "]";
+    }
+  }
   fw_R_ = R_;
   fw_p_ = p_;
   fw_v_ = v_;
@@ -358,6 +444,24 @@ bool ESKF::Predict(const IMUData& imu) {
     dt = imu.secs - last_imu_time_;
   }
 
+  // ★ 2026-10-19 (Plan A 根治) —— dt 上限。
+  //   背景: init 阻塞 ~35 s, 期间 IMU 回调持续 Predict 而 last_obs_time_ 停摆; init 后
+  //   首帧 dt 可跨越数秒~整段时间轴, 0.5*a*dt^2 把状态甩出千米级(实测单帧位移 2748 m),
+  //   下游 deskew 依此打散点云 -> knn_valid=0 -> 退化为纯航位推算。
+  //   本机器人 IMU 200 Hz(dt≈5 ms), |dt|>0.5 s 只可能来自记账断裂: 重锚时间轴并跳过
+  //   本样本(不做积分/不更新协方差), 让下一帧从干净时间基准继续。
+  if (std::fabs(dt) > 0.5) {
+    static long dt_jump_hits = 0;
+    if (++dt_jump_hits <= 5 || dt_jump_hits % 100 == 0)
+      LOG(WARNING) << "[ESKF] dt jump " << dt << " s (imu=" << imu.secs
+                   << ", last_imu=" << last_imu_time_ << ", last_obs=" << last_obs_time_
+                   << ") -> re-anchor, skip sample  (hit " << dt_jump_hits << ")";
+    last_imu_time_ = imu.secs;
+    last_imu_ = imu;
+    current_time_ = imu.secs;
+    return false;
+  }
+
   V3 acc = 0.5 * (imu.acc + last_imu_.acc);
   acc = imu_scale_ * acc;
   acc = acc - ba_;
@@ -437,9 +541,14 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   // 解算耗时累加器（作用域需覆盖迭代循环与函数末尾的落盘处）
   double _t_nav_us = 0.0, _t_calib_us = 0.0, _t_joint_us = 0.0;
 
+  // rev87: association-freeze threshold.  stock = 2 (iterations 3+ reuse
+  // iteration 2's association); M20_NC_ITER=0 freezes at the propagated pose
+  // (iterations 1+ reuse iteration 0) = classic one-association-per-frame ICP.
+  static const int rev87_nc_iter =
+      [] { const char* v = std::getenv("M20_NC_ITER"); return v ? std::atoi(v) : 2; }();
   need_converge_ = false;
   for (int iter = 0; iter < options_.num_iterations_; ++iter) {
-    if(iter > 2){
+    if(iter > rev87_nc_iter){
       need_converge_ = true;
     }
 
@@ -536,11 +645,51 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       V3d weak_dir = eig_HTVH.eigenvectors().col(0);
       double dx_long = std::abs(dx_nav.template segment<3>(3).cast<double>().dot(weak_dir));
       cum_dx_long += dx_long;
+      dbg_cond = cond_Pkinv; dbg_dx_long = dx_long;   // UNGATED tap
+      dbg_PinvH_yy = Pk_inv_nav(2, 2);                // UNGATED tap
+
+      // ── M20 rotation-block observability + residual split (entry 67) ──────
+      // The degeneracy gate and ev_HTVH above both read ONLY the translation
+      // block (3,3).  Yaw observability lives in the rotation block (0,0) and
+      // was never examined.  Record it, and split the residual by block, so
+      // "the solver is chasing a yaw residual that the scan observes weakly"
+      // can be seen or refuted per frame.
+      double cond_R = 0.0, res_rot = 0.0, res_tr = 0.0;
+      {
+        Eigen::SelfAdjointEigenSolver<M3d> eig_R(
+            HTVH_pose.template block<3, 3>(0, 0).cast<double>());
+        V3d ev_R = eig_R.eigenvalues();
+        const double cond_T = (ev_H(0) > 1e-12) ? ev_H(2) / ev_H(0) : 0.0;
+        cond_R = (ev_R(0) > 1e-12) ? ev_R(2) / ev_R(0) : 0.0;
+        res_rot = HTVr_pose.template segment<3>(0).cast<double>().norm();
+        res_tr = HTVr_pose.template segment<3>(3).cast<double>().norm();
+        static std::FILE* m20_rotdiag = nullptr;
+        if (!m20_rotdiag) {
+          m20_rotdiag = std::fopen("/tmp/m20_rotdiag.csv", "w");
+          if (m20_rotdiag) {
+            std::fprintf(m20_rotdiag,
+                "t,evR0,evR1,evR2,evT0,evT1,evT2,condR,condT,res_rot,res_tr,"
+                "drz,dxn\n");
+            std::fflush(m20_rotdiag);
+          }
+        }
+        if (m20_rotdiag) {
+          std::fprintf(m20_rotdiag,
+              "%.6f,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
+              current_time_, ev_R(0), ev_R(1), ev_R(2), ev_H(0), ev_H(1), ev_H(2),
+              cond_R, cond_T, res_rot, res_tr,
+              static_cast<double>(dx_nav(2)),
+              dx_nav.template segment<3>(3).cast<double>().norm());
+          if ((solver_diag % 200) == 0) std::fflush(m20_rotdiag);
+        }
+      }
+
 
       if (solver_diag <= 5 || solver_diag % 200 == 0) {
         LOG(INFO) << "[SolverDiag#" << solver_diag << "]"
                   << " cond(P⁻¹+H)=" << cond_Pkinv
                   << " ev_HTVH=[" << ev_H(0) << " " << ev_H(1) << " " << ev_H(2) << "]"
+                  << " | evROT=[" << cond_R << "]"
                   << " dx_long=" << dx_long << " cum_dx_long=" << cum_dx_long
                   << " P_lb=" << (g_p_lower_bound_enabled ? "ON" : "OFF");
       }

@@ -52,7 +52,16 @@ namespace LI2Sup{
   extern float g_intensity_weight;   // extra weight multiplier for high-intensity points
   extern bool  g_enable_downsample;
   extern float g_voxel_fliter_size;
-  extern double g_lidar1_time_offset;   // clock correction for lidar1 (seconds)
+  extern double g_lidar1_time_offset;
+  extern double g_drop_long_frames_ms;
+  extern bool   g_use_true_time_window;
+  // P0-5 deskew mode: 0 = per-point IMU-interpolated deskew (the shipped path),
+  // 1 = NO deskew (every point left in its own frame; a single end pose is used).
+  // This exists because the geometric instrument and the estimator disagree about
+  // whether the raw cloud is already compensated; the estimator is the arbiter,
+  // and it needs a switch to be asked.
+  extern int    g_deskew_mode;   // P0-4: start/end from true min/max   // P0-4(d): drop frames whose span exceeds this (ms); 0 = off   // clock correction for lidar1 (seconds)
+  extern double g_lidar1_scan_period;   // lidar1 frame period (s); >0 enables azimuth-based deskew when the cloud has no per-point timestamps
 
   /// second LiDAR (dual-LiDAR fusion)
   extern bool   g_dual_lidar_enable;
@@ -64,6 +73,12 @@ namespace LI2Sup{
   extern int    g_filter_rate_2;
   extern double g_lidar2_weight;        // observation weight relative to lidar1 (1.0 = equal)
   extern double g_lidar2_time_offset;   // clock correction: lidar2_time + offset = imu_time (seconds)
+  // true(默认)=改造前行为: 用动态补偿把 lidar2 对齐到 lidar1 的 header 域(B2 用)。
+  // false=两雷达共享同一时钟时用(如 M20 同一个 rslidar_sdk): 该动态量只反映两雷达
+  //       的扫描相位差(独立旋转,最大一个扫描周期),会把 lidar2 时间整体挪十几~几十 ms,
+  //       此时应改为与 lidar1 同一条规则: header + g_lidar2_time_offset + g_lidar1_time_offset。
+  extern bool   g_lidar2_use_dynamic_offset;
+  extern double g_lidar2_scan_period;   // lidar2 frame period (s); >0 enables azimuth-based deskew
 
   extern int    g_imu_type;
   extern double g_gravity_norm;
@@ -75,6 +90,13 @@ namespace LI2Sup{
   extern BASIC::SE3 g_lidar_imu;      // lidar in imu frame
   extern BASIC::SE3 g_odom_robo;      // lidar in robot frame
   extern BASIC::M3  g_lidar_robo_yaw; // lidar in robot frame rotation only yaw
+
+  /// ROS frame ids (configurable via lio.frame.*, no longer hard-coded)
+  extern std::string g_frame_world;   // global frame for odom / clouds / TF
+  extern std::string g_frame_imu;     // body (imu) frame
+  extern std::string g_frame_map;     // nav2 map frame
+  extern std::string g_frame_odom;    // nav2 odom frame
+  extern std::string g_frame_base;    // nav2 base frame
 
   /// hash_map
   extern std::size_t g_ivox_capacity;

@@ -399,7 +399,7 @@ void SuperLIO::ProcessCaceMap(){
   namespace fs = std::filesystem;
 
   std::string pcd_folder = g_save_map_dir + "/PCD";
-  std::string output_map_name = g_save_map_dir + "/" + g_map_name;
+  std::string output_map_name = ((g_map_name.size() && g_map_name[0] == '/') ? g_map_name : (g_save_map_dir + "/" + g_map_name));
 
   LOG(INFO) << YELLOW << " ---> Merging PCD fragments in: " << pcd_folder << RESET;
 
@@ -471,7 +471,7 @@ void SuperLIO::saveMap(){
 
   LOG(INFO) << YELLOW << " ---> Saving map..... " << RESET;
   if(!point_map_->empty()){
-    std::string map_name = g_save_map_dir + "/" + g_map_name;
+    std::string map_name = ((g_map_name.size() && g_map_name[0] == '/') ? g_map_name : (g_save_map_dir + "/" + g_map_name));
     LOG(INFO) << YELLOW << " ---> Save map to: " << map_name << RESET;
     pcl::VoxelGrid<PointType> voxel_fliter;
     PointCloudType latst_map;
@@ -500,15 +500,49 @@ inline double get_cpu_time_seconds() {
 
 void SuperLIO::Propagation_Undistort(){
   propagate_states_.clear();
-  propagate_states_.emplace_back(kf_->GetDynamicState());
+  const auto seed_state = kf_->GetDynamicState();   // ★ 2026-10-19 Plan A: 播种态快照(用于守卫回滚)
+  const auto seed_sys   = kf_->GetSysState();       //   对应 SetX() 需要的类型
+  propagate_states_.emplace_back(seed_state);
   // (C1) 本组的时间基准：有 lidar1 用它，否则用 lidar2（lidar2-only 组）
   kf_->SetObsTime(measures_.has_lidar1 ? measures_.lidar.end_time : measures_.lidar2.end_time);
   for (auto &imu : measures_.imu) {
     kf_->Predict(imu);
     propagate_states_.emplace_back(kf_->GetDynamicState());
   }
+  // ★ 2026-10-19 Plan A —— 单帧位移守卫。
+  //   背景: init 阻塞 ~35 s, 期间 last_obs_time_/时间记账停在 init 前; init 后第一帧的
+  //   IMU 传播会把状态甩出数米(实测 7.1–7.9 m), 依此做 deskew 则点云被打散、knn_valid=0,
+  //   整段退化为纯航位推算。本机器人一帧(<=0.2 s)物理上不可能位移 0.5 m, 故超限即判为
+  //   时间记账不连续: 回滚滤波器状态到播种态、丢弃该帧 IMU 块, 并打 WARNING。
+  {
+    const double dp = (propagate_states_.back().p - seed_state.p).norm();
+    static long guard_hits = 0; static long guard_frames = 0; ++guard_frames;
+    if (dp > 0.5) {
+      ++guard_hits;
+      if (guard_hits <= 5 || guard_hits % 100 == 0)
+        LOG(WARNING) << "[PropGuard] frame propagation displaced " << dp
+                     << " m in one frame -> discard IMU block, restore seed "
+                     << "(hit " << guard_hits << "/" << guard_frames << ")";
+      kf_->SetX(seed_sys);
+      propagate_states_.clear();
+      propagate_states_.emplace_back(seed_state);
+      kf_->SetObsTime(measures_.has_lidar1 ? measures_.lidar.end_time : measures_.lidar2.end_time);
+    }
+  }
   // per-frame reset of the deskew-fallback accounting (reported next to [FeatDiag])
+  {  // P0-4 step1: report the PREVIOUS call population split, then reset
+    static long pu_calls = 0;
+    ++pu_calls;
+    if (pu_calls <= 4 || pu_calls % 200 == 0)
+      LOG(INFO) << "[PU] call=" << pu_calls
+                << " prev below=" << stale_lo_n1_.load(std::memory_order_relaxed)
+                << " inside=" << stale_in_n1_.load(std::memory_order_relaxed)
+                << " above=" << stale_n1_.load(std::memory_order_relaxed)
+                << " | imu_states=" << measures_.imu.size();
+  }
   stale_n1_.store(0, std::memory_order_relaxed);
+  stale_in_n1_.store(0, std::memory_order_relaxed);
+  stale_lo_n1_.store(0, std::memory_order_relaxed);
   stale_n2_.store(0, std::memory_order_relaxed);
   stale_dt1_.store(0, std::memory_order_relaxed);
   stale_dt2_.store(0, std::memory_order_relaxed);
@@ -516,6 +550,13 @@ void SuperLIO::Propagation_Undistort(){
   const SE3 T_end = kf_->GetSE3();
   const M3  R_inv = T_end.R_.transpose();
   const V3  T_end_t = T_end.t_;
+
+  // P0-5 positive control: measure the displacement the deskew actually applies,
+  // so "deskew off changes nothing" can be told apart from "the switch did not
+  // take effect".  Declared at FUNCTION scope: the log that reads them sits after
+  // the LiDAR-1 block closes, which is what broke the previous build.
+  std::atomic<double> dsk_sum{0.0};
+  std::atomic<long>   dsk_n{0};
 
   // ── LiDAR 1 deskew ──────────────────────────────────────────
   {
@@ -528,6 +569,24 @@ void SuperLIO::Propagation_Undistort(){
 
     // (C1) lidar2-only 组：raw_pc == nullptr ⇒ ptsize=0，本块整体空转（后续按实际 size 合并 lidar2）
     std::size_t ptsize = raw_pc ? raw_pc->points.size() : 0;
+    if (raw_pc && kf_->GetTime() > 1791880426.60 && kf_->GetTime() < 1791880427.40) {
+      const double kf6 = kf_->GetTime();
+      const double lt6 = measures_.lidar.end_time;
+      FILE* ft = std::fopen("/tmp/rev106_frames.csv", "a");
+      if (ft) { std::fprintf(ft, "%.6f,%.6f,%zu\n", kf6, lt6, raw_pc->points.size()); std::fclose(ft); }
+      char nm[128];
+      std::snprintf(nm, sizeof(nm), "/tmp/rev106_raw_%.3f.csv", kf6);
+      FILE* f = std::fopen(nm, "w");
+      if (f) {
+        char b[192];
+        for (std::size_t i = 0; i < raw_pc->points.size(); ++i) {
+          const auto& p = raw_pc->points[i];
+          int k = std::snprintf(b, sizeof(b), "%zu,%.6f,%.6f,%.6f,%.4f", i, p.x, p.y, p.z, p.intensity);
+          b[k++] = 10; std::fwrite(b, 1, static_cast<std::size_t>(k), f);
+        }
+        std::fclose(f);
+      }
+    }
     scan_undistort_full_->resize(ptsize);
     full_motion_info_.resize(ptsize);  // Phase 2: per-point velocity for time-offset Jacobian
 
@@ -553,6 +612,23 @@ void SuperLIO::Propagation_Undistort(){
                                std::memory_order_relaxed);
           continue;
         }
+        // P0-4: query_time < front <=> the bracket search finds nothing and
+        // match_iter silently stays at begin(): the uncounted FRONT miss.
+        {
+          const double tf = propagate_states_.front().time;
+          const double tb = propagate_states_.back().time;
+          if (query_time < tf) {
+            stale_lo_n1_.fetch_add(1, std::memory_order_relaxed);
+            // (batch4-item1a) This MUST live inside the `query_time < tf` branch.
+            // It used to sit one level out (mis-indented), so it counted EVERY
+            // point and reported 47,565,970 -- "half the points fall off the front
+            // of the IMU window" -- which was a pure placement artefact and has
+            // been retracted.  `below` is 0 in every call that was ever measured.
+            stale_lo_total_.fetch_add(1, std::memory_order_relaxed);
+          } else if (query_time <= tb) {
+            stale_in_n1_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
         auto match_iter = propagate_states_.begin();
         for (auto iter = propagate_states_.begin(); iter != propagate_states_.end(); ++iter) {
           auto next_iter = std::next(iter);
@@ -573,7 +649,17 @@ void SuperLIO::Propagation_Undistort(){
         M3 R_i = Quat(R_h).slerp(s, Quat(R_t)).toRotationMatrix();
         V3 t_ei(p_h + v_h * dt + 0.5 * acc_t * dt * dt - T_end_t);
         V3 raw(pt.x, pt.y, pt.z);
+        // P0-5: with deskew_mode=1 every point keeps its own frame -- i.e. NO
+        // motion compensation at all.  Setting R_i to the frame-end rotation and
+        // t_ei to zero makes R_inv*(R_end*(TLI_R*raw+TLI_t)) collapse to exactly
+        // (TLI_R*raw + TLI_t), the untouched point in the IMU body frame.
+        if (g_deskew_mode != 0) { R_i = T_end.R_; t_ei.setZero(); }
         V3 eigen_point = R_inv * (R_i * (TLI_R * raw + TLI_t) + t_ei);
+        {
+          const V3 raw_imu = TLI_R * raw + TLI_t;
+          dsk_sum.fetch_add((eigen_point - raw_imu).norm(), std::memory_order_relaxed);
+          dsk_n.fetch_add(1, std::memory_order_relaxed);
+        }
         pt_full.x = eigen_point[0];
         pt_full.y = eigen_point[1];
         pt_full.z = eigen_point[2];
@@ -590,6 +676,18 @@ void SuperLIO::Propagation_Undistort(){
         }
       }
     });
+  }
+
+  {  // P0-5 one-shot: what the deskew actually moved, per mode
+    static int dsk_log = 0;
+    if (dsk_log < 4) {
+      ++dsk_log;
+      const long dn = dsk_n.load(std::memory_order_relaxed);
+      LOG(INFO) << "[Deskew] mode=" << g_deskew_mode << " n=" << dn
+                << " mean|deskew displacement| = "
+                << (dn ? dsk_sum.load(std::memory_order_relaxed) / dn * 1e3 : 0.0)
+                << " mm";
+    }
   }
 
   // ── LiDAR 2 deskew (dual-LiDAR) ─────────────────────────────
@@ -700,6 +798,34 @@ void SuperLIO::Propagation_Undistort(){
 void SuperLIO::DownSample(){
   voxel_grid_fliter_.setInputCloud(scan_undistort_full_);
   voxel_grid_fliter_.filter(ds_undistort_);
+  if (kf_->GetTime() > 1791880426.60 && kf_->GetTime() < 1791880427.40) {
+    const double kf6 = kf_->GetTime();
+    char nm[128];
+    std::snprintf(nm, sizeof(nm), "/tmp/rev106_ds_%.3f.csv", kf6);
+    FILE* f = std::fopen(nm, "w");
+    if (f) {
+      char b[192];
+      for (std::size_t i = 0; i < ds_undistort_->size(); ++i) {
+        const auto& p = ds_undistort_->points[i];
+        int k = std::snprintf(b, sizeof(b), "%zu,%.6f,%.6f,%.6f,%.4f", i, p.x, p.y, p.z, p.intensity);
+        b[k++] = 10; std::fwrite(b, 1, static_cast<std::size_t>(k), f);
+      }
+      std::fclose(f);
+    }
+    std::vector<float> mv; ivox_->getMap(mv);
+    std::snprintf(nm, sizeof(nm), "/tmp/rev106_map_%.3f.csv", kf6);
+    FILE* fm = std::fopen(nm, "w");
+    if (fm) {
+      char b[128];
+      for (std::size_t i = 0; i + 2 < mv.size(); i += 3) {
+        int k = std::snprintf(b, sizeof(b), "%.6f,%.6f,%.6f", mv[i], mv[i+1], mv[i+2]);
+        b[k++] = 10; std::fwrite(b, 1, static_cast<std::size_t>(k), fm);
+      }
+      std::fclose(fm);
+    }
+    FILE* fd = std::fopen("/tmp/rev106_dscount.csv", "a");
+    if (fd) { std::fprintf(fd, "%.6f,%zu,%zu\n", kf6, ds_undistort_->size(), mv.size()/3); std::fclose(fd); }
+  }
 }
 
 
@@ -1075,7 +1201,22 @@ void SuperLIO::Observe(){
           if(effect_mask_[idx]){
             auto& abcd = abcd_vec_[idx];
             scalar error;
-            effect_mask_[idx] = compute_error(abcd, point_world, _lengths[idx], error);
+            const bool ok6 = compute_error(abcd, point_world, _lengths[idx], error);
+            if (kf_->GetTime() > 1791880426.60 && kf_->GetTime() < 1791880427.40) {
+              static FILE* f6 = std::fopen("/tmp/rev106_assoc.csv", "a");
+              if (f6) {
+                char b[512];
+                int k = std::snprintf(b, sizeof(b), "%.3f,%d,%.6f,%d,%.6f,%.6f,%.6f",
+                                      kf_->GetTime(), iter_num, _lengths[idx], ok6 ? 1 : 0,
+                                      point_world[0], point_world[1], point_world[2]);
+                for (int q = 0; q < top_K.count && k < 460; ++q)
+                  k += std::snprintf(b + k, sizeof(b) - k, ",%.6f,%.6f,%.6f",
+                                     top_K.points_[q][0], top_K.points_[q][1], top_K.points_[q][2]);
+                k += std::snprintf(b + k, sizeof(b) - k, ",%d", static_cast<int>(top_K.count));
+                b[k++] = 10; std::fwrite(b, 1, static_cast<std::size_t>(k), f6);
+              }
+            }
+            effect_mask_[idx] = ok6;
             if(effect_mask_[idx]){
               V3d normvec(abcd[0], abcd[1], abcd[2]);
               V3d nb = R_transpose * normvec;
@@ -1478,6 +1619,8 @@ void SuperLIO::Observe(){
           LOG(INFO) << "[Stale#" << feat_diag_count << "]"
                     << " L1 n=" << n1
                     << " dt=" << (n1 ? double(stale_dt1_.load(std::memory_order_relaxed)) / n1 / 1e6 : 0.0)
+                    << "s | LO n=" << stale_lo_n1_.load(std::memory_order_relaxed)
+                    << " (total " << stale_lo_total_.load(std::memory_order_relaxed) << ")"
                     << "s | L2 n=" << n2
                     << " dt=" << (n2 ? double(stale_dt2_.load(std::memory_order_relaxed)) / n2 / 1e6 : 0.0)
                     << "s";
@@ -1485,6 +1628,35 @@ void SuperLIO::Observe(){
       }
     }
 
+    // ── M20 per-iteration CSV tap (2026-10-14) ── ungated, so Sum(dRz) per
+    //    frame is exact and the [Bias#] %2 print factor is not needed.
+    {
+      static FILE* m20_csv = nullptr;
+      static long m20_rows = 0;
+      if (!m20_csv) {
+        m20_csv = std::fopen("/tmp/m20_trace.csv", "w");
+        if (m20_csv) {
+          std::fprintf(m20_csv,
+              "t_data,frame,iter,dRz,wz,bgz,pts,knn_valid,plane,edge,htv,cond,dxlong,htv_y,pinvh_yy\n");
+          std::fflush(m20_csv);
+        } else {
+          LOG(ERROR) << "[M20CSV] cannot open /tmp/m20_trace.csv";
+        }
+      }
+      if (m20_csv) {
+        int ec = 0, pc = 0;
+        for (size_t i = 0; i < ptsize; ++i) if (edge_mask_[i]) ec++;
+        for (size_t i = 0; i < ptsize; ++i) if (effect_mask_[i]) pc++;
+        std::fprintf(m20_csv,
+            "%.6f,%d,%d,%.10g,%.10g,%.10g,%zu,%d,%d,%d,%.8g,%.8g,%.10g,%.8g,%.8g\n",
+            measures_.lidar.end_time, static_cast<int>(frame_num_), iter_num,
+            kf_->dbg_dR_z, kf_->dbg_w_z(), kf_->dbg_bg_z(),
+            ptsize, static_cast<int>(effect_knn_num_), pc, ec,
+            sum_HTVr.norm(), kf_->dbg_cond, kf_->dbg_dx_long,
+            sum_HTVr(2), kf_->dbg_PinvH_yy);
+        if ((++m20_rows % 500) == 0) std::fflush(m20_csv);
+      }
+    }
     iter_num++;
   });
 

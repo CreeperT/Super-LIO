@@ -1,9 +1,11 @@
-.vscode
+*.bak
+*.bak-*
 build
-devel
-log
-install
-./logs
-.catkin_workspace
 .catkin_tools
+.catkin_workspace
+devel
+install
+log
+logs
 src/CMakeLists.txt
+.vscode

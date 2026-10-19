@@ -118,6 +118,14 @@ public:
   bool shouldResetMap() const { return reset_map_requested_; }
   void clearResetMapFlag() { reset_map_requested_ = false; }
 
+  // -- M20 per-iteration diagnostic tap (2026-10-14). Read-only taps: they do
+  //    not feed back into the estimate, so behaviour stays neutral.
+  double dbg_dR_z = 0.0;
+  double dbg_PinvH_yy = 0.0;   // (P^-1+H)(2,2), the yaw diagonal      // rotation correction applied by the last Update()
+  double dbg_cond = 0.0;      // cond(P^-1 + H) of the last navigation solve
+  double dbg_dx_long = 0.0;   // longitudinal |dx| of the last navigation solve
+  double dbg_w_z() const { return body_omega_(2); }
+  double dbg_bg_z() const { return bg_(2); }
   void setCalibEnabled(bool en) { calib_enabled_ = en; }
   bool isCalibEnabled() const { return calib_enabled_; }
   void setCalibS0(double s0) { calib_s0_ = s0; }

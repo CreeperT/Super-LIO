@@ -139,8 +139,19 @@ protected:
   // means the IMU bundle of that frame ended before the scan did (timing-dependent).
   // Written inside a tbb::parallel_for ⇒ atomics; per-frame, reset at the top of the
   // undistort and reported next to [FeatDiag].
-  std::atomic<long> stale_n1_{0}, stale_n2_{0};          // counts (LiDAR1 / LiDAR2)
-  std::atomic<long> stale_dt1_{0}, stale_dt2_{0};        // Σ(query_time − last IMU time), µs
+  // The three-way bookkeeping over the bracket search (per frame, reset at the top
+  // of the undistort and reported by [PU]):
+  //   above  = query_time > back().time  -> copied RAW, no motion compensation
+  //   below  = query_time < front().time -> bracket search finds nothing, silently
+  //            keeps match_iter = begin()  (the FRONT miss)
+  //   inside = window-touching frames that are neither of the above
+  // `total` is the cumulative count of the `below` class ONLY (never reset) and is
+  // what verifies that the `below` branch is the only one incrementing it.
+  std::atomic<long> stale_n1_{0}, stale_n2_{0};   // above  (LiDAR1 / LiDAR2)
+  std::atomic<long> stale_lo_n1_{0};              // below, per frame
+  std::atomic<long> stale_lo_total_{0};           // below, cumulative, NEVER reset
+  std::atomic<long> stale_in_n1_{0};              // inside the window
+  std::atomic<long> stale_dt1_{0}, stale_dt2_{0}; // Σ(query_time − last IMU time), µs
 
   Timer time_record_;
 };

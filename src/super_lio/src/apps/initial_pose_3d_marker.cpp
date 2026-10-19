@@ -31,6 +31,7 @@ public:
     this->declare_parameter("init_x", 0.0);
     this->declare_parameter("init_y", 0.0);
     this->declare_parameter("init_z", 0.2);
+    this->declare_parameter("world_frame", std::string("world"));
 
     pose_.position.x = this->get_parameter("init_x").as_double();
     pose_.position.y = this->get_parameter("init_y").as_double();
@@ -78,7 +79,7 @@ private:
     };
 
     visualization_msgs::msg::InteractiveMarker im;
-    im.header.frame_id = "world";
+    im.header.frame_id = this->get_parameter("world_frame").as_string();
     im.name = "initial_pose_3d";
     im.description = "6-DOF Pose: drag sphere (move) | rings (rotate)";
     im.pose = pose_;
