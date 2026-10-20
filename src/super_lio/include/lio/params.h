@@ -56,6 +56,20 @@ namespace LI2Sup{
     return gate.hit(item_enabled && g_log_enable, period);
   }
 
+  /// 调试 CSV 落盘 (lio.dump.*) —— 原来是硬编码路径(/tmp/... 与 /home/creepert/...)
+  extern bool        g_dump_enable;      // 总开关(默认 false; 论文/排查时才开)
+  extern std::string g_dump_dir;         // 落盘目录; "" = <源码根>/logs
+  extern double      g_dump_max_mb;      // 单文件上限(MB), 超限轮转 .1/.2; 0 = 不限
+  extern bool g_dump_upd;                // m20_upd.csv       (ESKF 每帧修正量)
+  extern bool g_dump_rotdiag;            // m20_rotdiag.csv   (旋转块可观性/残差)
+  extern bool g_dump_trace;              // m20_trace.csv     (逐迭代 dRz/条件数)
+  extern bool g_dump_solver_time;        // solver_time.csv   (解算耗时, 论文表 VII)
+  extern bool g_dump_structure;          // structure.csv     (结构正则性通道)
+  extern bool g_dump_pose_dc;            // pose_dc(.v2).csv  (Eq.(20) 验证)
+  extern bool g_dump_p_diag;             // p_diag.csv / p_matrix_<N>.csv
+  extern bool g_dump_decouple_verify;    // decouple_verify.csv (18³ vs 32³ 等价性)
+  extern bool g_dump_calib_curve;        // calib_curve.csv   (在线外参曲线)
+
   extern bool g_save_map;
   extern bool g_if_filter;
   extern std::string g_map_name;

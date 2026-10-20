@@ -90,6 +90,46 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.declare_parameter<double>("lio.log.input_period_sec", g_log_input_period_sec);
   node.get_parameter("lio.log.input_period_sec", g_log_input_period_sec);
 
+  // ── 调试 CSV 落盘 (lio.dump.*) ──────────────────────────────────────────
+  node.declare_parameter<bool>("lio.dump.enable", g_dump_enable);
+  node.get_parameter("lio.dump.enable", g_dump_enable);
+  node.declare_parameter<std::string>("lio.dump.dir", g_dump_dir);
+  node.get_parameter("lio.dump.dir", g_dump_dir);
+  node.declare_parameter<double>("lio.dump.max_file_mb", g_dump_max_mb);
+  node.get_parameter("lio.dump.max_file_mb", g_dump_max_mb);
+  node.declare_parameter<bool>("lio.dump.upd", g_dump_upd);
+  node.get_parameter("lio.dump.upd", g_dump_upd);
+  node.declare_parameter<bool>("lio.dump.rotdiag", g_dump_rotdiag);
+  node.get_parameter("lio.dump.rotdiag", g_dump_rotdiag);
+  node.declare_parameter<bool>("lio.dump.trace", g_dump_trace);
+  node.get_parameter("lio.dump.trace", g_dump_trace);
+  node.declare_parameter<bool>("lio.dump.solver_time", g_dump_solver_time);
+  node.get_parameter("lio.dump.solver_time", g_dump_solver_time);
+  node.declare_parameter<bool>("lio.dump.structure", g_dump_structure);
+  node.get_parameter("lio.dump.structure", g_dump_structure);
+  node.declare_parameter<bool>("lio.dump.pose_dc", g_dump_pose_dc);
+  node.get_parameter("lio.dump.pose_dc", g_dump_pose_dc);
+  node.declare_parameter<bool>("lio.dump.p_diag", g_dump_p_diag);
+  node.get_parameter("lio.dump.p_diag", g_dump_p_diag);
+  node.declare_parameter<bool>("lio.dump.decouple_verify", g_dump_decouple_verify);
+  node.get_parameter("lio.dump.decouple_verify", g_dump_decouple_verify);
+  node.declare_parameter<bool>("lio.dump.calib_curve", g_dump_calib_curve);
+  node.get_parameter("lio.dump.calib_curve", g_dump_calib_curve);
+
+  if (g_log_enable && g_dump_enable)
+    LOG(INFO) << GREEN << " ---> [Dump] dir='"
+              << (g_dump_dir.empty() ? (g_root_dir + "/logs") : g_dump_dir)
+              << "' max_file_mb=" << g_dump_max_mb
+              << " | upd=" << (g_dump_upd ? "on" : "off")
+              << " rotdiag=" << (g_dump_rotdiag ? "on" : "off")
+              << " trace=" << (g_dump_trace ? "on" : "off")
+              << " solver_time=" << (g_dump_solver_time ? "on" : "off")
+              << " structure=" << (g_dump_structure ? "on" : "off")
+              << " pose_dc=" << (g_dump_pose_dc ? "on" : "off")
+              << " p_diag=" << (g_dump_p_diag ? "on" : "off")
+              << " decouple=" << (g_dump_decouple_verify ? "on" : "off")
+              << " calib_curve=" << (g_dump_calib_curve ? "on" : "off") << RESET;
+
   // 总开关关掉时，旧的逐帧诊断开关(lio.eva.verbose_logging)也一并失效。
   if (!g_log_enable) g_verbose_logging = false;
 

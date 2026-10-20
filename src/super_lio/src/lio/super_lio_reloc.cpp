@@ -1,5 +1,6 @@
 
 #include "lio/super_lio_reloc.h"
+#include "common/csv_dump.h"
 
 #include <sys/resource.h>
 #include <fstream>
@@ -649,28 +650,33 @@ void SuperLIOReLoc::Output() {
     }
 
     // ── Paper figures: per-frame CSV dump (extrinsics + P structure) ──
+    // 全部由 lio.dump.* 控制；默认关（这几条路径原来写死 /home/creepert/...，
+    // 在 Jetson 上不存在 ⇒ 一直在静默空转）。
     {
-      SE3 est1 = kf_->getExtrinsic1();
-      SE3 est2 = kf_->getExtrinsic2();
-      V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
-      V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
-      static std::ofstream csv("/home/creepert/Super-LIO/src/super_lio/logs/calib_curve.csv", std::ios::app);
-      csv << calib_log_count
-          << "," << est1.t_.transpose() << "," << rpy1.transpose()
-          << "," << est2.t_.transpose() << "," << rpy2.transpose()
-          << "," << (rpy1 - rpy2).transpose() << "\n";
+      if (auto* csv = dump_stream("calib_curve", g_dump_calib_curve)) {
+        SE3 est1 = kf_->getExtrinsic1();
+        SE3 est2 = kf_->getExtrinsic2();
+        V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
+        V3 rpy2 = SO3(est2.R_).log_vee() * 180.0 / M_PI;
+        *csv << calib_log_count
+             << "," << est1.t_.transpose() << "," << rpy1.transpose()
+             << "," << est2.t_.transpose() << "," << rpy2.transpose()
+             << "," << (rpy1 - rpy2).transpose() << "\n";
+      }
 
       // P structure: per-frame ||P_nc||_F (cross-block) + full 32×32 snapshot
-      static std::ofstream pcsv("/home/creepert/Super-LIO/src/super_lio/logs/p_diag.csv", std::ios::app);
-      const auto P = kf_->GetCov();
-      double pnc = P.block(0, 18, 18, 14).norm() + P.block(18, 0, 14, 18).norm();
-      pcsv << calib_log_count << "," << pnc << "\n";
-      if (calib_log_count == 3000 || calib_log_count == 6000) {
-        std::ofstream pfull("/home/creepert/Super-LIO/src/super_lio/logs/p_matrix_" +
-                            std::to_string(calib_log_count) + ".csv", std::ios::trunc);
-        for (int r = 0; r < P.rows(); ++r) {
-          for (int c = 0; c < P.cols(); ++c) {
-            pfull << P(r, c) << (c + 1 == P.cols() ? "\n" : ",");
+      if (auto* pcsv = dump_stream("p_diag", g_dump_p_diag)) {
+        const auto P = kf_->GetCov();
+        double pnc = P.block(0, 18, 18, 14).norm() + P.block(18, 0, 14, 18).norm();
+        *pcsv << calib_log_count << "," << pnc << "\n";
+        if (calib_log_count == 3000 || calib_log_count == 6000) {
+          const std::string nm = "p_matrix_" + std::to_string(calib_log_count);
+          if (auto* pfull = dump_stream(nm.c_str(), true)) {
+            for (int r = 0; r < P.rows(); ++r) {
+              for (int c = 0; c < P.cols(); ++c) {
+                *pfull << P(r, c) << (c + 1 == P.cols() ? "\n" : ",");
+              }
+            }
           }
         }
       }

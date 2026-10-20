@@ -1,5 +1,6 @@
 #include "lio/ESKF.h"
 #include "basic/logs.h"
+#include "common/csv_dump.h"
 #include <fstream>
 #include <chrono>   // 解算耗时埋点（论文表 VII：联合 32³ vs 解耦 18³+14³）
 #include <cstdlib>
@@ -286,25 +287,17 @@ void ESKF::Update() {
   R_ = R_ * SO3::Exp(dx_.template block<3, 1>(0, 0));
   const double m20_yaw_a =
       std::atan2(static_cast<double>(R_.R_(1, 0)), static_cast<double>(R_.R_(0, 0)));
-  {
-    static std::FILE* m20_upd = nullptr;
-    if (!m20_upd) {
-      m20_upd = std::fopen("/tmp/m20_upd.csv", "w");
-      if (m20_upd) {
-        std::fprintf(m20_upd, "t,dx0,dx1,dx2,yaw_b,yaw_a,dyaw_world,tilt,bgz\n");
-        std::fflush(m20_upd);
-      }
-    }
-    if (m20_upd) {
-      double d = m20_yaw_a - m20_yaw_b;
-      while (d > M_PI) d -= 2.0 * M_PI;
-      while (d < -M_PI) d += 2.0 * M_PI;
-      std::fprintf(m20_upd,
-          "%.6f,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
-          current_time_, static_cast<double>(dx_(0)), static_cast<double>(dx_(1)),
-          static_cast<double>(dx_(2)), m20_yaw_b, m20_yaw_a, d, m20_tilt,
-          static_cast<double>(bg_(2)));
-    }
+  if (auto* m20_upd = dump_file("m20_upd", g_dump_upd,
+                                "t,dx0,dx1,dx2,yaw_b,yaw_a,dyaw_world,tilt,bgz")) {
+    double d = m20_yaw_a - m20_yaw_b;
+    while (d > M_PI) d -= 2.0 * M_PI;
+    while (d < -M_PI) d += 2.0 * M_PI;
+    std::fprintf(m20_upd,
+        "%.6f,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g,%.10g\n",
+        current_time_, static_cast<double>(dx_(0)), static_cast<double>(dx_(1)),
+        static_cast<double>(dx_(2)), m20_yaw_b, m20_yaw_a, d, m20_tilt,
+        static_cast<double>(bg_(2)));
+    std::fflush(m20_upd);
   }
   p_ += dx_.template block<3, 1>(3, 0);
   v_ += dx_.template block<3, 1>(6, 0);
@@ -620,9 +613,10 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
                   << (diff_nav > 1e-3 ? " *** MISMATCH ***" : "");
       }
       // Paper figure: per-frame CSV (frame, diff_nav, diff_calib, ||dx_full||, ||dx_dec||)
-      static std::ofstream dv("/home/creepert/Super-LIO/src/super_lio/logs/decouple_verify.csv", std::ios::app);
-      dv << cmp_count << "," << diff_nav << "," << diff_calib
-         << "," << dx_full.norm() << "," << dx_nav.norm() << "\n";
+      if (auto* dv = dump_stream("decouple_verify", g_dump_decouple_verify)) {
+        *dv << cmp_count << "," << diff_nav << "," << diff_calib
+            << "," << dx_full.norm() << "," << dx_nav.norm() << "\n";
+      }
     }
 
     // Map nav correction to full state vector
@@ -663,24 +657,15 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
         cond_R = (ev_R(0) > 1e-12) ? ev_R(2) / ev_R(0) : 0.0;
         res_rot = HTVr_pose.template segment<3>(0).cast<double>().norm();
         res_tr = HTVr_pose.template segment<3>(3).cast<double>().norm();
-        static std::FILE* m20_rotdiag = nullptr;
-        if (!m20_rotdiag) {
-          m20_rotdiag = std::fopen("/tmp/m20_rotdiag.csv", "w");
-          if (m20_rotdiag) {
-            std::fprintf(m20_rotdiag,
-                "t,evR0,evR1,evR2,evT0,evT1,evT2,condR,condT,res_rot,res_tr,"
-                "drz,dxn\n");
-            std::fflush(m20_rotdiag);
-          }
-        }
-        if (m20_rotdiag) {
+        if (auto* m20_rotdiag = dump_file("m20_rotdiag", g_dump_rotdiag,
+              "t,evR0,evR1,evR2,evT0,evT1,evT2,condR,condT,res_rot,res_tr,drz,dxn")) {
           std::fprintf(m20_rotdiag,
               "%.6f,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g\n",
               current_time_, ev_R(0), ev_R(1), ev_R(2), ev_H(0), ev_H(1), ev_H(2),
               cond_R, cond_T, res_rot, res_tr,
               static_cast<double>(dx_nav(2)),
               dx_nav.template segment<3>(3).cast<double>().norm());
-          if ((solver_diag % 200) == 0) std::fflush(m20_rotdiag);
+          std::fflush(m20_rotdiag);
         }
       }
 
@@ -781,9 +766,11 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   // ── 解算耗时与标定时偏落盘（论文表 VII 运行时间 / 表 VIII 时偏行）──
   {
     static int _st_cnt = 0;
-    static std::ofstream st("/home/creepert/Super-LIO/src/super_lio/logs/solver_time.csv", std::ios::app);
-    st << (++_st_cnt) << "," << _t_nav_us << "," << _t_calib_us << "," << _t_joint_us
-       << "," << delta_t1_ << "," << delta_t2_ << "\n";
+    ++_st_cnt;
+    if (auto* st = dump_stream("solver_time", g_dump_solver_time)) {
+      *st << _st_cnt << "," << _t_nav_us << "," << _t_calib_us << "," << _t_joint_us
+          << "," << delta_t1_ << "," << delta_t2_ << "\n";
+    }
   }
 
   Pk = P_;

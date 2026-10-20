@@ -1,5 +1,6 @@
 
 #include "lio/super_lio.h"
+#include "common/csv_dump.h"
 
 #include <sys/resource.h>
 #include <fstream>
@@ -1514,13 +1515,13 @@ void SuperLIO::Observe(){
           ? sum_dtheta_wall / n_snap_wall * 180.0 / M_PI : 0.0;
       const double grade_deg = grade_resid_tan * 180.0 / M_PI;
       if (iter_num == 0) {
-        static std::ofstream st("/home/creepert/Super-LIO/src/super_lio/logs/structure.csv",
-                                std::ios::app);
-        st << frame_num_ << "," << n_snap_wall << "," << dth_w << ","
-           << n_fit_ok << "," << n_fit_fail << ","
-           << n_cls_ground << "," << n_cls_wall << "," << n_cls_mid << ","
-           << (scan_ground_valid_ ? scan_ground_inliers_ : 0) << ","
-           << grade_deg << "," << (scan_ground_valid_ ? 1 : 0) << "\n";
+        if (auto* st = dump_stream("structure", g_dump_structure)) {
+          *st << frame_num_ << "," << n_snap_wall << "," << dth_w << ","
+              << n_fit_ok << "," << n_fit_fail << ","
+              << n_cls_ground << "," << n_cls_wall << "," << n_cls_mid << ","
+              << (scan_ground_valid_ ? scan_ground_inliers_ : 0) << ","
+              << grade_deg << "," << (scan_ground_valid_ ? 1 : 0) << "\n";
+        }
         static int st_count = 0;
         if (++st_count <= 3 || st_count % 200 == 0) {
           LOG(INFO) << "[Structure#" << st_count << "]"
@@ -1538,16 +1539,16 @@ void SuperLIO::Observe(){
     // ── Paper §3: per-frame H_pose + ΔC dump for Eq.(20) prediction validation ──
     // Columns: frame, H_pose(36), ΔC1(36), ΔC2(36) — row-major. Once per frame (iter 0).
     if (g_decouple_verify && iter_num == 0) {
-      static std::ofstream pdc("/home/creepert/Super-LIO/src/super_lio/logs/pose_dc.csv",
-                               std::ios::app);
-      pdc << frame_num_;
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc << "," << sum_HTVH(r, c);
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc << "," << sum_DC1(r, c);
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc << "," << sum_DC2(r, c);
-      pdc << "\n";
+      if (auto* pdc = dump_stream("pose_dc", g_dump_pose_dc)) {
+        *pdc << frame_num_;
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc << "," << sum_HTVH(r, c);
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc << "," << sum_DC1(r, c);
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc << "," << sum_DC2(r, c);
+        *pdc << "\n";
+      }
     }
 
     // ── Paper §3 (extended): H_pose + ΔC1/ΔC2 + timestamps + current relative extrinsic ──
@@ -1555,28 +1556,28 @@ void SuperLIO::Observe(){
     // rel_* is T̂_L1⁻¹·T̂_L2 (rotation as angle-axis vector, translation in L1 frame); the analysis
     // script subtracts the converged (physical) value to obtain ξ_Δ for the Eq.(20) projection.
     if (g_pose_dc_dump && iter_num == 0) {
-      const SE3 T1 = kf_->getExtrinsic1();
-      const SE3 T2 = kf_->getExtrinsic2();
-      M3d R1T = T1.R_.transpose().cast<double>();
-      M3d R_rel = R1T * T2.R_.cast<double>();
-      V3d t_rel = R1T * (T2.t_.cast<double>() - T1.t_.cast<double>());
-      Eigen::AngleAxisd aa(R_rel);
+      if (auto* pdc2 = dump_stream("pose_dc_v2", g_dump_pose_dc)) {
+        const SE3 T1 = kf_->getExtrinsic1();
+        const SE3 T2 = kf_->getExtrinsic2();
+        M3d R1T = T1.R_.transpose().cast<double>();
+        M3d R_rel = R1T * T2.R_.cast<double>();
+        V3d t_rel = R1T * (T2.t_.cast<double>() - T1.t_.cast<double>());
+        Eigen::AngleAxisd aa(R_rel);
 
-      static std::ofstream pdc2("/home/creepert/Super-LIO/src/super_lio/logs/pose_dc_v2.csv",
-                                std::ios::app);
-      // 时间戳用最新 IMU 采样时间：lidar.end_time 在重定位模式下不逐帧更新（恒为常量）
-      pdc2 << frame_num_ << ","
-           << (measures_.imu.empty() ? 0.0 : measures_.imu.back().secs);
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_HTVH(r, c);
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_DC1(r, c);
-      for (int r = 0; r < 6; ++r)
-        for (int c = 0; c < 6; ++c) pdc2 << "," << sum_DC2(r, c);
-      V3d rvec = aa.axis() * aa.angle();
-      for (int i = 0; i < 3; ++i) pdc2 << "," << rvec(i);
-      for (int i = 0; i < 3; ++i) pdc2 << "," << t_rel(i);
-      pdc2 << "\n";
+        // 时间戳用最新 IMU 采样时间：lidar.end_time 在重定位模式下不逐帧更新（恒为常量）
+        *pdc2 << frame_num_ << ","
+              << (measures_.imu.empty() ? 0.0 : measures_.imu.back().secs);
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc2 << "," << sum_HTVH(r, c);
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc2 << "," << sum_DC1(r, c);
+        for (int r = 0; r < 6; ++r)
+          for (int c = 0; c < 6; ++c) *pdc2 << "," << sum_DC2(r, c);
+        V3d rvec = aa.axis() * aa.angle();
+        for (int i = 0; i < 3; ++i) *pdc2 << "," << rvec(i);
+        for (int i = 0; i < 3; ++i) *pdc2 << "," << t_rel(i);
+        *pdc2 << "\n";
+      }
     }
 
     // publish feature points for visualization
@@ -1634,19 +1635,8 @@ void SuperLIO::Observe(){
     // ── M20 per-iteration CSV tap (2026-10-14) ── ungated, so Sum(dRz) per
     //    frame is exact and the [Bias#] %2 print factor is not needed.
     {
-      static FILE* m20_csv = nullptr;
-      static long m20_rows = 0;
-      if (!m20_csv) {
-        m20_csv = std::fopen("/tmp/m20_trace.csv", "w");
-        if (m20_csv) {
-          std::fprintf(m20_csv,
-              "t_data,frame,iter,dRz,wz,bgz,pts,knn_valid,plane,edge,htv,cond,dxlong,htv_y,pinvh_yy\n");
-          std::fflush(m20_csv);
-        } else {
-          LOG(ERROR) << "[M20CSV] cannot open /tmp/m20_trace.csv";
-        }
-      }
-      if (m20_csv) {
+      if (auto* m20_csv = dump_file("m20_trace", g_dump_trace,
+            "t_data,frame,iter,dRz,wz,bgz,pts,knn_valid,plane,edge,htv,cond,dxlong,htv_y,pinvh_yy")) {
         int ec = 0, pc = 0;
         for (size_t i = 0; i < ptsize; ++i) if (edge_mask_[i]) ec++;
         for (size_t i = 0; i < ptsize; ++i) if (effect_mask_[i]) pc++;
@@ -1657,7 +1647,7 @@ void SuperLIO::Observe(){
             ptsize, static_cast<int>(effect_knn_num_), pc, ec,
             sum_HTVr.norm(), kf_->dbg_cond, kf_->dbg_dx_long,
             sum_HTVr(2), kf_->dbg_PinvH_yy);
-        if ((++m20_rows % 500) == 0) std::fflush(m20_csv);
+        std::fflush(m20_csv);
       }
     }
     iter_num++;

@@ -14,7 +14,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_super_lio = get_package_share_directory('super_lio')
     config_yaml = os.path.join(pkg_super_lio, 'config', 'M20.yaml')
-    rviz_config_file = os.path.join(pkg_super_lio, 'rviz', 'lio.rviz')
+    rviz_config_file = os.path.join(pkg_super_lio, 'rviz', 'relocation.rviz')
 
     declare_rviz_arg = DeclareLaunchArgument(
         'rviz', default_value='true', description='Whether to start RVIZ2')

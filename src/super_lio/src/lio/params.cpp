@@ -32,6 +32,20 @@ namespace LI2Sup{
   int  g_log_solver_frames = 200;
   double g_log_input_period_sec = 100.0;
 
+  /// debug CSV dumps (lio.dump.*) —— 默认全关；打开后按 lio.dump.* 逐路控制
+  bool        g_dump_enable = false;
+  std::string g_dump_dir    = "";
+  double      g_dump_max_mb = 64.0;
+  bool g_dump_upd             = true;
+  bool g_dump_rotdiag         = true;
+  bool g_dump_trace           = true;
+  bool g_dump_solver_time     = true;
+  bool g_dump_structure       = true;
+  bool g_dump_pose_dc         = true;
+  bool g_dump_p_diag          = true;
+  bool g_dump_decouple_verify = true;
+  bool g_dump_calib_curve     = true;
+
   bool   g_save_map;
   bool   g_if_filter; 
   string g_save_map_dir;

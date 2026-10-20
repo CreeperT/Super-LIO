@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## 2026-10-20（续）: 调试 CSV 落盘全量 YAML 化（`lio.dump.*`）+ b2.yaml 同步 + 机器人侧改动回灌
+
+**问题**：13 处调试 CSV 落盘写死路径 —— `/tmp/m20_{upd,rotdiag,trace}.csv` 每次解算迭代都写、无限增长；
+`/home/creepert/Super-LIO/src/super_lio/logs/*.csv` 在 Jetson 上不存在（用户 `ysc`）⇒ 静默空转，论文 CSV 在真机为空。
+
+**改动**：
+- 新增 `include/common/csv_dump.h`：`dump_file()`(stdio) / `dump_stream()`(ostream)，
+  目录自动创建、新文件写表头（轮转后也写）、单文件超限轮转 `.1/.2`、打开失败只登一次 WARNING；
+- `lio.dump.enable / .dir / .max_file_mb` + 9 个逐路开关（`upd/rotdiag/trace/solver_time/structure/pose_dc/p_diag/decouple_verify/calib_curve`）；
+- 13 个落盘点全部改走助手；`std::filesystem` 判断流大小改用 `tellp()`（`file_size` 受缓冲影响会漏轮转）；
+- `config/M20.yaml`：`enable: false` + `dir: "/mnt/nvme/logs"`（机器人默认不写盘）；
+- `config/b2.yaml`：`enable: true` + `dir: ""`（= 源码根/logs，与改造前硬编码路径等价，论文线行为不变），
+  并补齐 `lio.log.*` 整节。
+
+**验证**：`colcon build --packages-select super_lio` EXIT=0；关闭模式无 `[Dump]` 行、不建目录；打开 + 回放交付袋 25 s +
+2 KB 上限 → 4 路 CSV 各生成 `.csv/.1/.2`（145 次轮转，每份带表头）。详见 `DEEP_Robotics_ws/CHANGELOG.md` 续 120。
+
+**回灌**：`launch/M20_reloc.launch.py`（改为 `relocation.rviz`）与 `rviz/relocation.rviz` 由 Jetson 拉回，
+两侧 55 个文件 md5 完全一致；Jetson 源码树 44 个 `*.bak-*` 过程备份已打包到
+`/mnt/nvme/bags/_keep/src_bak_20261020.tar.gz` 并清除。
+
+**涉及文件**：`include/common/csv_dump.h`(新)、`include/lio/params.h`、`src/lio/params.cpp`、`src/ros/ROSWrapper.cpp`、
+`src/lio/ESKF.cpp`、`src/lio/super_lio.cpp`、`src/lio/super_lio_reloc.cpp`、`config/M20.yaml`、`config/b2.yaml`、
+`launch/M20_reloc.launch.py`、`rviz/relocation.rviz`
+
 ## 2026-10-20: M20 重定位线 —— 日志全量 YAML 化（`lio.log.*` 开关 + 每项打印频率）
 
 **背景**：M20 重定位排查期加了很多逐帧打印，其中两处是**计数 bug/常数写死**：`[M20BG]` 的

@@ -137,6 +137,22 @@
     lio.log.input_period_sec: 100.0       # ↑ 打印周期(秒, 按雷达头时间; 必须是小数)
     lio.log.update_map: false             # UpdateMap 进度(lio.relocation.update_map=true 时最多 100 行)
 
+    # ===================== 调试数据落盘 (CSV) =====================
+    # 这些 CSV 原来是硬编码路径：/tmp/m20_*.csv 会无限增长，/home/creepert/... 在
+    # Jetson 上不存在(用户 ysc) ⇒ 一直静默空转。现在统一由本节控制，默认关。
+    lio.dump.enable: false                # 总开关：false = 一路 CSV 都不写
+    lio.dump.dir: "/mnt/nvme/logs"        # 落盘目录(自动创建)；"" = <源码根>/logs
+    lio.dump.max_file_mb: 64.0            # 单文件上限(MB)，超过轮转 .1/.2；0 = 不限
+    lio.dump.upd: true                    # m20_upd.csv      ESKF 每帧修正量
+    lio.dump.rotdiag: true                # m20_rotdiag.csv  旋转块可观性/残差
+    lio.dump.trace: true                  # m20_trace.csv    逐迭代 dRz/条件数
+    lio.dump.solver_time: true            # solver_time.csv  解算耗时(论文表 VII)
+    lio.dump.structure: true              # structure.csv    结构正则性通道
+    lio.dump.pose_dc: true                # pose_dc(.v2).csv Eq.(20) 验证
+    lio.dump.p_diag: true                 # p_diag.csv / p_matrix_<N>.csv
+    lio.dump.decouple_verify: true        # decouple_verify.csv 18³ vs 32³ 等价性
+    lio.dump.calib_curve: true            # calib_curve.csv  在线外参曲线
+
     # ===================== 重定位 ================================
     # ⚠ 本节只对 relocation_node 生效, 建图节点不用。首次重定位时用 marker 手柄填 init_pose。
     lio.relocation.update_map: false
