@@ -214,12 +214,12 @@ bool SuperLIO::kf_init(){
     }
     // Deadline reached: proceed rather than hang, but report the shortfall.
     if(static_cout > 0){
-      LOG(WARNING) << YELLOW
+      if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW
                    << " ---> [SuperLIO] Only " << static_cout << "/" << kMinStatic
                    << " stationary IMU samples (" << total_cout << " total) — gravity/bias"
                    << " init is unreliable. Keep the platform still at startup!" << RESET;
     }else{
-      LOG(WARNING) << YELLOW
+      if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW
                    << " ---> [SuperLIO] No stationary IMU sample in " << total_cout
                    << " samples — falling back to the raw mean. Gravity/bias init is"
                    << " unreliable. Keep the platform still at startup!" << RESET;
@@ -286,7 +286,7 @@ bool SuperLIO::map_init(){
   //（避免空指针 pc==nullptr，也避免用单雷达完成建图初始化的半初始化状态）
   if (!measures_.has_lidar1 || !measures_.lidar.pc) {
     if (frame_num_ <= 3) {
-      LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] map_init skipped: no lidar1 frame in group" << RESET;
+      if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] map_init skipped: no lidar1 frame in group" << RESET;
     }
     return false;
   }
@@ -338,7 +338,7 @@ void SuperLIO::stateProcess(){
   // ── Map reset on persistent degeneracy ──
   // In relocation mode, the prior map is the only reference — never clear it.
   if (allow_map_reset_ && kf_->shouldResetMap()) {
-    LOG(WARNING) << YELLOW << " ---> [LIO] Resetting map (degeneracy)."
+    if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> [LIO] Resetting map (degeneracy)."
                  << RESET;
     ivox_->clear();
     kf_->clearResetMapFlag();
@@ -416,7 +416,7 @@ void SuperLIO::ProcessCaceMap(){
         // LOG(INFO) << GREEN << " ---> Merged: " << entry.path().filename().string() 
         //           << "   size: " << tmp_cloud->size() << RESET;
       } else {
-        LOG(WARNING) << RED << " ---> Failed to load: " << entry.path().string() << RESET;
+        if (g_log_enable && g_log_warn) LOG(WARNING) << RED << " ---> Failed to load: " << entry.path().string() << RESET;
       }
     }
   }
@@ -520,7 +520,7 @@ void SuperLIO::Propagation_Undistort(){
     if (dp > 0.5) {
       ++guard_hits;
       if (guard_hits <= 5 || guard_hits % 100 == 0)
-        LOG(WARNING) << "[PropGuard] frame propagation displaced " << dp
+        if (g_log_enable && g_log_warn) LOG(WARNING) << "[PropGuard] frame propagation displaced " << dp
                      << " m in one frame -> discard IMU block, restore seed "
                      << "(hit " << guard_hits << "/" << guard_frames << ")";
       kf_->SetX(seed_sys);
@@ -533,7 +533,8 @@ void SuperLIO::Propagation_Undistort(){
   {  // P0-4 step1: report the PREVIOUS call population split, then reset
     static long pu_calls = 0;
     ++pu_calls;
-    if (pu_calls <= 4 || pu_calls % 200 == 0)
+    static LogGate pu_gate(4);
+    if (log_hit(pu_gate, g_log_solver, g_log_solver_frames))
       LOG(INFO) << "[PU] call=" << pu_calls
                 << " prev below=" << stale_lo_n1_.load(std::memory_order_relaxed)
                 << " inside=" << stale_in_n1_.load(std::memory_order_relaxed)
@@ -784,7 +785,7 @@ void SuperLIO::Propagation_Undistort(){
   } else {
     static bool nolidar2_logged = false;
     if (g_dual_lidar_enable && !nolidar2_logged) {
-      LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] lidar2 NOT available: has_lidar2="
+      if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> [Dual-LiDAR] lidar2 NOT available: has_lidar2="
                    << measures_.has_lidar2
                    << " pc=" << (measures_.lidar2.pc ? "ok" : "null")
                    << " empty=" << (measures_.lidar2.pc ? measures_.lidar2.pc->empty() : true)
@@ -1423,7 +1424,7 @@ void SuperLIO::Observe(){
                     << " deg. Only the longitudinal grade is held to this reference;"
                     << " the cross-slope is left untouched." << RESET;
         } else {
-          LOG(WARNING) << YELLOW << " ---> [Structure] No ground plane seen during the"
+          if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> [Structure] No ground plane seen during the"
                        << " initial stationary segment — falling back to"
                        << " lio.structure.ground_grade_deg." << RESET;
         }
@@ -1599,7 +1600,9 @@ void SuperLIO::Observe(){
     // ── Per-frame feature diagnostics (verbose only) ──
     if (g_verbose_logging) {
       static int feat_diag_count = 0;
-      if (++feat_diag_count <= 5 || feat_diag_count % 200 == 0) {
+      ++feat_diag_count;
+      static LogGate feat_diag_gate(5);
+      if (log_hit(feat_diag_gate, g_log_solver, g_log_solver_frames)) {
         int edge_count = 0;
         for (size_t i = 0; i < ptsize; ++i)
           if (edge_mask_[i]) edge_count++;

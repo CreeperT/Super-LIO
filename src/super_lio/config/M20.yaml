@@ -114,8 +114,28 @@
 
     # ===================== 性能评估 ==============================
     lio.eva.timer: true                   # ★ 首次跑 M20 必开, 用来定 filter_rate
-    lio.eva.verbose_logging: true
+    lio.eva.verbose_logging: true         # 逐帧诊断总闸（与下面 lio.log.enable 相与）
     lio.eva.decouple_verify: false
+
+    # ===================== 日志开关 / 打印频率 ====================
+    # 重定位节点(含其共用的 ESKF / ROSWrapper 诊断)里**所有** LOG 输出都由本节控制：
+    #   · 每个日志项一个开关；频率单位与"性能评估"同口径 —— eva 计时项按帧记录(每帧 1 次)，
+    #     这里用"每 N 帧一次"表达，默认 100 帧 ≈ 10 s (@10 Hz)，200 帧 ≈ 20 s。
+    #   · WARNING 由 lio.log.warn 控制；ERROR（载图失败等）不受控，始终输出。
+    #   · 只想看安静版: lio.log.enable: false（机器人行为完全不变，只是不打日志）。
+    lio.log.enable: true                  # 总开关: false = 关掉全部诊断日志
+    lio.log.warn: true                    # WARNING 级(退化/传播守卫/丢帧/IMU 回跳)
+    lio.log.reloc_init: true              # 重定位初始化(载图/z 边界/多分辨率目标/收敛结果)
+    lio.log.reloc_cand: false             # 每个 yaw×z 候选的 NDT/ICP 打分(一次初始化最多 60 行)
+    lio.log.calib: true                   # 在线外参 [Calib#] / [CalibUpdate#]
+    lio.log.calib_frames: 100             # ↑ 打印周期(帧; 1 = 每帧)
+    lio.log.bias: true                    # 零偏 [Bias#] / [M20BG]
+    lio.log.bias_frames: 100              # ↑ 打印周期(帧)
+    lio.log.solver: true                  # 求解器诊断 [SolverDiag#] / [FeatDiag#] / [Stale#] / [PU]
+    lio.log.solver_frames: 200            # ↑ 打印周期(帧)
+    lio.log.input: true                   # [Input] 输入记账(IMU/雷达实测频率与断流)
+    lio.log.input_period_sec: 100.0       # ↑ 打印周期(秒, 按雷达头时间; 必须是小数)
+    lio.log.update_map: false             # UpdateMap 进度(lio.relocation.update_map=true 时最多 100 行)
 
     # ===================== 重定位 ================================
     # ⚠ 本节只对 relocation_node 生效, 建图节点不用。首次重定位时用 marker 手柄填 init_pose。

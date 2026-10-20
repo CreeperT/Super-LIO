@@ -1,5 +1,6 @@
 
 #include <cstdio>
+#include <glog/logging.h>
 #include "ros/ROSWrapper.h"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include <iomanip>
@@ -10,11 +11,14 @@ using namespace BASIC;
 
 namespace LI2Sup{
 
-// Reporting period of the [Input] accounting line (seconds of header time).
-static constexpr double IN_LOG_SEC = 100.0;
-
 void LoadParamFromRos(rclcpp::Node& node)
 {
+  // 日志总开关必须最先读：后面所有参数回显也受它控制（否则关不掉启动横幅）。
+  // false 时把 glog 下限抬到 ERROR —— INFO/WARNING 全静默，ERROR/FATAL 仍输出。
+  node.declare_parameter<bool>("lio.log.enable", g_log_enable);
+  node.get_parameter("lio.log.enable", g_log_enable);
+  if (!g_log_enable) FLAGS_minloglevel = 2;
+
   node.declare_parameter<bool>("lio.map.save_map", false);
   node.declare_parameter<bool>("lio.sensor.use_true_time_window", false);
   node.get_parameter("lio.sensor.use_true_time_window", g_use_true_time_window);
@@ -58,6 +62,47 @@ void LoadParamFromRos(rclcpp::Node& node)
 
   node.declare_parameter<bool>("lio.eva.pose_dc_dump", false);
   node.get_parameter("lio.eva.pose_dc_dump", g_pose_dc_dump);
+
+  // ── 日志开关 / 打印频率 (lio.log.*) ──────────────────────────────────────
+  // 频率口径与"性能评估"一致：period=1 = 每帧(eva 计时项那档)，其余按"每 N 帧一次"。
+  node.declare_parameter<bool>("lio.log.warn", g_log_warn);
+  node.get_parameter("lio.log.warn", g_log_warn);
+  node.declare_parameter<bool>("lio.log.reloc_init", g_log_reloc_init);
+  node.get_parameter("lio.log.reloc_init", g_log_reloc_init);
+  node.declare_parameter<bool>("lio.log.reloc_cand", g_log_reloc_cand);
+  node.get_parameter("lio.log.reloc_cand", g_log_reloc_cand);
+  node.declare_parameter<bool>("lio.log.calib", g_log_calib);
+  node.get_parameter("lio.log.calib", g_log_calib);
+  node.declare_parameter<bool>("lio.log.bias", g_log_bias);
+  node.get_parameter("lio.log.bias", g_log_bias);
+  node.declare_parameter<bool>("lio.log.solver", g_log_solver);
+  node.get_parameter("lio.log.solver", g_log_solver);
+  node.declare_parameter<bool>("lio.log.input", g_log_input);
+  node.get_parameter("lio.log.input", g_log_input);
+  node.declare_parameter<bool>("lio.log.update_map", g_log_update_map);
+  node.get_parameter("lio.log.update_map", g_log_update_map);
+  node.declare_parameter<int>("lio.log.calib_frames", g_log_calib_frames);
+  node.get_parameter("lio.log.calib_frames", g_log_calib_frames);
+  node.declare_parameter<int>("lio.log.bias_frames", g_log_bias_frames);
+  node.get_parameter("lio.log.bias_frames", g_log_bias_frames);
+  node.declare_parameter<int>("lio.log.solver_frames", g_log_solver_frames);
+  node.get_parameter("lio.log.solver_frames", g_log_solver_frames);
+  node.declare_parameter<double>("lio.log.input_period_sec", g_log_input_period_sec);
+  node.get_parameter("lio.log.input_period_sec", g_log_input_period_sec);
+
+  // 总开关关掉时，旧的逐帧诊断开关(lio.eva.verbose_logging)也一并失效。
+  if (!g_log_enable) g_verbose_logging = false;
+
+  if (g_log_enable)
+  LOG(INFO) << GREEN << " ---> [Log] enable=" << (g_log_enable ? "true" : "false")
+            << " warn=" << (g_log_warn ? "true" : "false")
+            << " reloc_init=" << (g_log_reloc_init ? "true" : "false")
+            << " reloc_cand=" << (g_log_reloc_cand ? "true" : "false")
+            << " calib=" << (g_log_calib ? "true" : "false") << "/" << g_log_calib_frames << "f"
+            << " bias=" << (g_log_bias ? "true" : "false") << "/" << g_log_bias_frames << "f"
+            << " solver=" << (g_log_solver ? "true" : "false") << "/" << g_log_solver_frames << "f"
+            << " input=" << (g_log_input ? "true" : "false") << "/" << g_log_input_period_sec << "s"
+            << " update_map=" << (g_log_update_map ? "true" : "false") << RESET;
 
   node.declare_parameter<bool>("lio.map.if_filter", false);
   node.get_parameter("lio.map.if_filter", g_if_filter);
@@ -111,7 +156,7 @@ void LoadParamFromRos(rclcpp::Node& node)
   node.get_parameter("lio.sensor.voxel_fliter_size", g_voxel_fliter_size);
 
   if (g_voxel_fliter_size < 0.3) {
-    LOG(WARNING) << YELLOW
+    if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW
                  << " ---> voxel_fliter_size=" << g_voxel_fliter_size
                  << " < 0.3m: excessive points may cause HTVH condition "
                  << "degeneracy and memory pressure. Recommend ≥ 0.3m."
@@ -578,28 +623,30 @@ void ROSWrapper::setupIO(){
 }
 
 
-// Input-side accounting, one line per IN_LOG_SEC of header time. Reports the message
+// Input-side accounting, one line per lio.log.input_period_sec of header time. Reports the message
 // count and, more importantly, the EFFECTIVE rate (1/mean inter-arrival) and the largest
 // gap: those two reveal silent drops without needing to know the nominal rate. Called
 // from the scan handlers, so the line keeps coming even if the IMU stream dies.
 void ROSWrapper::logInputAccounting(double t){
   if (in_log_t_ < 0.0) { in_log_t_ = t; return; }
   const double dt = t - in_log_t_;
-  if (dt < IN_LOG_SEC) return;
-  const auto rate_of = [](const InStat& s) {
-    return (s.n > 1 && s.sum_gap > 1e-9) ? (s.n - 1) / s.sum_gap : 0.0;
-  };
-  LOG(INFO) << " ---> [Input] " << std::fixed << std::setprecision(1) << dt << "s: "
-            << "imu n=" << in_imu_.n << " rate=" << std::setprecision(1) << rate_of(in_imu_)
-            << "Hz maxgap=" << std::setprecision(3) << in_imu_.max_gap << "s"
-            << " | scan1 n=" << in_scan1_.n << " rate=" << std::setprecision(1) << rate_of(in_scan1_)
-            << "Hz maxgap=" << std::setprecision(3) << in_scan1_.max_gap << "s"
-            << " | scan2 n=" << in_scan2_.n << " rate=" << std::setprecision(1) << rate_of(in_scan2_)
-            << "Hz maxgap=" << std::setprecision(3) << in_scan2_.max_gap << "s"
-            << " | lag(相对全程首帧,s) imu " << std::setprecision(3) << in_imu_.lag.mean()
-            << "[" << in_imu_.lag.mn << "," << in_imu_.lag.mx << "]"
-            << " 1 " << in_scan1_.lag.mean() << "[" << in_scan1_.lag.mn << "," << in_scan1_.lag.mx << "]"
-            << " 2 " << in_scan2_.lag.mean() << "[" << in_scan2_.lag.mn << "," << in_scan2_.lag.mx << "]";
+  if (g_log_input_period_sec > 0.0 && dt < g_log_input_period_sec) return;
+  if (g_log_enable && g_log_input) {
+    const auto rate_of = [](const InStat& s) {
+      return (s.n > 1 && s.sum_gap > 1e-9) ? (s.n - 1) / s.sum_gap : 0.0;
+    };
+    LOG(INFO) << " ---> [Input] " << std::fixed << std::setprecision(1) << dt << "s: "
+              << "imu n=" << in_imu_.n << " rate=" << std::setprecision(1) << rate_of(in_imu_)
+              << "Hz maxgap=" << std::setprecision(3) << in_imu_.max_gap << "s"
+              << " | scan1 n=" << in_scan1_.n << " rate=" << std::setprecision(1) << rate_of(in_scan1_)
+              << "Hz maxgap=" << std::setprecision(3) << in_scan1_.max_gap << "s"
+              << " | scan2 n=" << in_scan2_.n << " rate=" << std::setprecision(1) << rate_of(in_scan2_)
+              << "Hz maxgap=" << std::setprecision(3) << in_scan2_.max_gap << "s"
+              << " | lag(相对全程首帧,s) imu " << std::setprecision(3) << in_imu_.lag.mean()
+              << "[" << in_imu_.lag.mn << "," << in_imu_.lag.mx << "]"
+              << " 1 " << in_scan1_.lag.mean() << "[" << in_scan1_.lag.mn << "," << in_scan1_.lag.mx << "]"
+              << " 2 " << in_scan2_.lag.mean() << "[" << in_scan2_.lag.mn << "," << in_scan2_.lag.mx << "]";
+  }
   in_log_t_ = t;
   for (InStat* s : {&in_imu_, &in_scan1_, &in_scan2_}) {   // keep `last` so the boundary gap survives
     s->n = 0;
@@ -621,7 +668,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
                  msg->angular_velocity.z);
 
   if (data.secs < last_timestamp_imu_) {
-    LOG(WARNING) << "imu loop back, clear buffer";
+    if (g_log_enable && g_log_warn) LOG(WARNING) << "imu loop back, clear buffer";
     imu_buffer_.clear();
     imu_buffer_.push_back(data);
     last_timestamp_imu_ = data.secs;
@@ -718,7 +765,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     if (g_drop_long_frames_ms > 0.0 && raw_span_ms > g_drop_long_frames_ms) {
       static int drop_n = 0;
       if (++drop_n <= 5 || drop_n % 20 == 0)
-        LOG(WARNING) << "[DropLong] true span " << raw_span_ms << " ms (lead "
+        if (g_log_enable && g_log_warn) LOG(WARNING) << "[DropLong] true span " << raw_span_ms << " ms (lead "
                      << lead_ms << " ms) > " << g_drop_long_frames_ms
                      << " -> dropped (n=" << drop_n << ")";
       return;
@@ -1051,7 +1098,7 @@ void ROSWrapper::stdMsgHandler2(const sensor_msgs::msg::PointCloud2::SharedPtr m
     if (pl_orig.empty()) {
       static bool empty_logged = false;
       if (!empty_logged) {
-        LOG(WARNING) << YELLOW << " ---> [LIVOX_PC2 lidar2] Deserialization produced empty cloud!"
+        if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> [LIVOX_PC2 lidar2] Deserialization produced empty cloud!"
                      << " msg fields: " << pcl::getFieldsList(*msg)
                      << " data size: " << msg->data.size() << RESET;
         empty_logged = true;

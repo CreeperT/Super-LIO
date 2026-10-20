@@ -22,6 +22,11 @@
 
 namespace LI2Sup{
 
+// 日志总开关（定义在 src/lio/params.cpp）。这里只做前置声明，
+// 避免这个模板头反过来依赖 lio/params.h；作用是把库级的 std::cout 横幅
+// 也纳入 lio.log.enable 的控制（关掉后只剩 ERROR 级输出）。
+extern bool g_log_enable;
+
 template<int K, typename Point>
 class KNNHeap {
 public:
@@ -167,8 +172,9 @@ public:
   
   OctVoxMap(Options options){
     SetOptions(options);
-    std::cout << " ---> OctVoxMap init. Resolution: " << resolution_ 
-              << " Capacity: " << capacity_ << std::endl;
+    if (g_log_enable)
+      std::cout << " ---> OctVoxMap init. Resolution: " << resolution_ 
+                << " Capacity: " << capacity_ << std::endl;
     flat_search_ptrs_.reserve(flat_search_order_offsets.size());
     for(std::size_t i = 0; i < flat_search_order_offsets.size(); i++){
       uint16_t start = flat_search_order_offsets[i];
@@ -266,7 +272,8 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
   if(reset_map_){
     reset_map_count_--;
     if(reset_map_count_ > 0){
-      std::cout << "OctVoxMap::insert skip: reset_map_count_ = " << reset_map_count_ << std::endl;
+      if (g_log_enable)
+        std::cout << "OctVoxMap::insert skip: reset_map_count_ = " << reset_map_count_ << std::endl;
       return;
     } 
     reset_map_ = false;
@@ -505,8 +512,9 @@ void OctVoxMap<Point, Scalar>::clear() {
 
 template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::printInfo() const {
-    std::cout << " ---> OctVoxMap info. Size: " << data_.size() 
-              << " Capacity: " << capacity_ << std::endl;
+    if (g_log_enable)
+      std::cout << " ---> OctVoxMap info. Size: " << data_.size() 
+                << " Capacity: " << capacity_ << std::endl;
 }
 
 }

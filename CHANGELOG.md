@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## 2026-10-20: M20 重定位线 —— 日志全量 YAML 化（`lio.log.*` 开关 + 每项打印频率）
+
+**背景**：M20 重定位排查期加了很多逐帧打印，其中两处是**计数 bug/常数写死**：`[M20BG]` 的
+`if (m20_rep < 3 || (++m20_rep % 500) == 0)` 因短路使 `m20_rep` 永不累加 ⇒ **每帧一条（≈10 Hz）**；
+ESKF `[Bias#]` 的 `% 2 == 0` ⇒ **每 2 帧一条（≈5 Hz）**。另：候选 NDT/ICP 打分一次初始化最多 60 行、
+`Update map Delay` 100 行（`std::cout`，不受任何开关控制）、`[Input]` 周期写死 `IN_LOG_SEC = 100.0`。
+
+**改动**：
+- 新增 `include/common/log_gate.h`（`LogGate`：前 `first_n` 次放行 + 之后每 `period` 帧一次，`count()` 供 `#N` 编号）；
+- `include/lio/params.h` 增 `lio.log.*` 全局量与 `log_hit(gate, item, period)`（与总开关相与）；
+- `src/lio/params.cpp` 默认值；`src/ros/ROSWrapper.cpp` 声明/读取参数 + 打印一行 `[Log]` 生效配置，
+  总开关在参数加载**最前面**读取并置 `FLAGS_minloglevel=2`（INFO/WARNING 全静默，ERROR/FATAL 保留）；
+- 接入点：`src/lio/super_lio_reloc.cpp`（全部 INFO/`std::cout`）、`src/lio/ESKF.cpp`（`[M20BG]`/`[Bias#]`/`[SolverDiag#]`/`[CalibUpdate#]` + 5 处 WARNING）、
+  `src/lio/super_lio.cpp`（`[PU]`/`[FeatDiag]`/`[Stale#]` + 8 处 WARNING）、`src/ros/ROSWrapper.cpp`（`[Input]` + 4 处 WARNING）、
+  `include/OctVoxMap/OctVoxMap.hpp`（3 处 `std::cout` 横幅）；
+- `config/M20.yaml` 新增「日志开关 / 打印频率」节（12 个键，频率口径与「性能评估」一致：`period=1` = 每帧 = eva 计时项）。
+
+**验证**：`colcon build --packages-select super_lio` EXIT=0（Jetson，1 min 52 s）；`relocation_node` 在
+`ROS_DOMAIN_ID=42 + ROS_LOCALHOST_ONLY=1` 下冒烟：默认模式正常打印并载入 `/mnt/nvme/map/4F.pcd`
+（238 360 点，Map init 29 ms），`lio.log.enable: false` 时**本节点 0 条日志**。详见 `DEEP_Robotics_ws/CHANGELOG.md`
+
+**涉及文件**：`include/common/log_gate.h`（新）、`include/lio/params.h`、`src/lio/params.cpp`、
+`src/ros/ROSWrapper.cpp`、`src/lio/super_lio_reloc.cpp`、`src/lio/ESKF.cpp`、`src/lio/super_lio.cpp`、
+`include/OctVoxMap/OctVoxMap.hpp`、`config/M20.yaml`；随附 `x11vnc` 开机修复见同一提交（Jetson 侧文件，不在本仓）。
+
 ## 2026-09-22（续 24）: Stage 1 判定 —— **四项全通过**；★ 新增"腿间刚性"检验（1.3b）；`|ba|` 越界归因解决
 
 **Stage 1**（`exp_repeat/aslam_stage1_r1`，16:58:15–17:12:46；`b2.yaml` 零改动，录 `/lio/odom` +

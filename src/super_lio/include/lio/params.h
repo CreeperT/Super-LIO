@@ -20,6 +20,7 @@
 
 #include "basic/alias.h"
 #include "basic/Manifold.h"
+#include "common/log_gate.h"
 
 
 namespace LI2Sup{
@@ -33,6 +34,27 @@ namespace LI2Sup{
   extern bool g_verbose_logging;  // enable per-frame diagnostic logs
   extern bool g_decouple_verify;  // compare 18×18 decoupled vs 32×32 full solve
   extern bool g_pose_dc_dump;     // dump per-frame H_pose + ΔC + relative extrinsic (Eq.(20) analysis)
+
+  /// logging control (config: "日志开关 / 打印频率")
+  /// 所有诊断 LOG 都由 lio.log.* 控制；WARNING 另由 g_log_warn 控制，ERROR 不受控（永远输出）。
+  extern bool g_log_enable;        // 总开关: false = 关掉全部诊断日志
+  extern bool g_log_warn;          // WARNING 级诊断（退化/传播守卫/丢帧/IMU 回跳）
+  extern bool g_log_reloc_init;    // 重定位初始化: 载图/z 边界/多分辨率目标/收敛结果
+  extern bool g_log_reloc_cand;    // 每个 yaw×z 候选的 NDT/ICP 打分
+  extern bool g_log_calib;         // [Calib#] / [CalibUpdate#]
+  extern bool g_log_bias;          // [Bias#] / [M20BG]
+  extern bool g_log_solver;        // [SolverDiag#] / [FeatDiag#] / [Stale#] / [PU]
+  extern bool g_log_input;         // [Input] 输入记账
+  extern bool g_log_update_map;    // UpdateMap 进度
+  extern int  g_log_calib_frames;  // [Calib#] 打印周期(帧)
+  extern int  g_log_bias_frames;   // [Bias#]/[M20BG] 打印周期(帧)
+  extern int  g_log_solver_frames; // 求解器诊断打印周期(帧)
+  extern double g_log_input_period_sec;  // [Input] 打印周期(秒, 按雷达头时间)
+
+  /// 统一日志闸门：item_enabled 与总开关相与；period<=0 表示该点不打印。
+  inline bool log_hit(LogGate& gate, bool item_enabled, int period) {
+    return gate.hit(item_enabled && g_log_enable, period);
+  }
 
   extern bool g_save_map;
   extern bool g_if_filter;

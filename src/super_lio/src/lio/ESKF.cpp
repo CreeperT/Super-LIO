@@ -164,7 +164,7 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
   static constexpr int MAP_RESET_DEGEN_FRAMES = 100;
   if (consecutive_degen_frames_ > MAP_RESET_DEGEN_FRAMES && !reset_map_requested_) {
     reset_map_requested_ = true;
-    LOG(WARNING) << "[ESKF] Persistent degeneracy " << consecutive_degen_frames_
+    if (g_log_enable && g_log_warn) LOG(WARNING) << "[ESKF] Persistent degeneracy " << consecutive_degen_frames_
                  << " frames — map reset requested";
   }
 
@@ -214,7 +214,7 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
       cond_count = 1;
       V3d weak_dir = eig_H.eigenvectors().col(0);
       V_f += weak_dir * weak_dir.transpose();
-      LOG(WARNING) << "[ESKF] Degeneracy (κ): HTVH_trans κ=" << cond_H
+      if (g_log_enable && g_log_warn) LOG(WARNING) << "[ESKF] Degeneracy (κ): HTVH_trans κ=" << cond_H
                    << " > " << degen_opts_.htvh_cond_thresh
                    << " λ_min=" << ev_min << " < " << HTVH_MIN_EV_THRESH
                    << " | ev_H=[" << ev_H(0) << ", " << ev_H(1) << ", " << ev_H(2) << "]"
@@ -250,7 +250,7 @@ void ESKF::RemapDegeneracy(const M3& Q_trans, const M6& HTVH, STATE& dx) {
     dx.segment<3>(3) = dx_trans.cast<scalar>();
 
     if (sigma_count > 0) {
-      LOG(WARNING) << "[ESKF] Degeneracy (σ): " << sigma_count
+      if (g_log_enable && g_log_warn) LOG(WARNING) << "[ESKF] Degeneracy (σ): " << sigma_count
                    << "/3 dims, σ=[" << std::sqrt(std::max(0.0, ev_Q(0)))
                    << ", " << std::sqrt(std::max(0.0, ev_Q(1)))
                    << ", " << std::sqrt(std::max(0.0, ev_Q(2))) << "]m"
@@ -334,8 +334,8 @@ void ESKF::Update() {
     m20_t_prev = current_time_;
   }
   {
-    static int m20_rep = 0;
-    if (m20_rep < 3 || (++m20_rep % 500) == 0) {
+    static LogGate m20bg_gate(3);         // 前 3 帧每帧，之后 lio.log.bias_frames
+    if (log_hit(m20bg_gate, g_log_bias, g_log_bias_frames)) {
       LOG(INFO) << "[M20BG] clamp=" << m20_clamp << " gate=" << m20_gate
                 << " leak=" << m20_leak << " rejected=" << m20_rejected
                 << "/" << m20_seen << " bg_z=" << bg_(2) << " t=" << current_time_;
@@ -352,9 +352,9 @@ void ESKF::Update() {
   // ① bg_z 涨到 ≈ ω_z  => 陀螺零偏把转速吸收掉了
   // ② dR ≈ -ω·dt(反向) => 观测修正在对抗陀螺
   {
-    static int bias_dbg = 0;
-    if (++bias_dbg <= 5 || bias_dbg % 2 == 0) {
-      LOG(INFO) << "[Bias#" << bias_dbg << "] bg=[" << bg_(0) << "," << bg_(1) << "," << bg_(2)
+    static LogGate bias_dbg_gate(5);
+    if (log_hit(bias_dbg_gate, g_log_bias, g_log_bias_frames)) {
+      LOG(INFO) << "[Bias#" << bias_dbg_gate.count() << "] bg=[" << bg_(0) << "," << bg_(1) << "," << bg_(2)
                 << "] dR=[" << dx_.template block<3, 1>(0, 0)(0) << "," << dx_.template block<3, 1>(0, 0)(1)
                 << "," << dx_.template block<3, 1>(0, 0)(2)
                 << "] w=[" << body_omega_(0) << "," << body_omega_(1) << "," << body_omega_(2) << "]";
@@ -453,7 +453,7 @@ bool ESKF::Predict(const IMUData& imu) {
   if (std::fabs(dt) > 0.5) {
     static long dt_jump_hits = 0;
     if (++dt_jump_hits <= 5 || dt_jump_hits % 100 == 0)
-      LOG(WARNING) << "[ESKF] dt jump " << dt << " s (imu=" << imu.secs
+      if (g_log_enable && g_log_warn) LOG(WARNING) << "[ESKF] dt jump " << dt << " s (imu=" << imu.secs
                    << ", last_imu=" << last_imu_time_ << ", last_obs=" << last_obs_time_
                    << ") -> re-anchor, skip sample  (hit " << dt_jump_hits << ")";
     last_imu_time_ = imu.secs;
@@ -685,7 +685,8 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       }
 
 
-      if (solver_diag <= 5 || solver_diag % 200 == 0) {
+      static LogGate solver_diag_gate(5);
+      if (log_hit(solver_diag_gate, g_log_solver, g_log_solver_frames)) {
         LOG(INFO) << "[SolverDiag#" << solver_diag << "]"
                   << " cond(P⁻¹+H)=" << cond_Pkinv
                   << " ev_HTVH=[" << ev_H(0) << " " << ev_H(1) << " " << ev_H(2) << "]"
@@ -754,14 +755,14 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     delta_t1_ += dx_calib(12);
     delta_t2_ += dx_calib(13);
 
-    // Debug: print calibration correction every frame
-    static int calib_dbg = 0;
-    if (++calib_dbg <= 5 || calib_dbg % 200 == 0) {
+    // Debug: calibration correction, throttled by lio.log.calib_frames
+    static LogGate calib_dbg_gate(5);
+    if (log_hit(calib_dbg_gate, g_log_calib, g_log_calib_frames)) {
       scalar deg1 = dx_calib.template segment<3>(0).norm() * 180.0 / M_PI;
       scalar deg2 = dx_calib.template segment<3>(6).norm() * 180.0 / M_PI;
       double ddt1 = dx_calib(12);  // time offset correction (seconds)
       double ddt2 = dx_calib(13);
-      LOG(INFO) << "[CalibUpdate#" << calib_dbg
+      LOG(INFO) << "[CalibUpdate#" << calib_dbg_gate.count()
                 << "] |dθ1|=" << deg1 << "° |dt1|=" << dx_calib.template segment<3>(3).norm() << "m"
                 << " |dθ2|=" << deg2 << "° |dt2|=" << dx_calib.template segment<3>(9).norm() << "m"
                 << " |dδt1|=" << (ddt1 * 1000.0) << "ms"
@@ -834,7 +835,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       conflict_count++;
       if (conflict_count > 20 && !reset_map_requested_) {
         reset_map_requested_ = true;
-        LOG(WARNING) << "[ESKF] Map conflict detected — |HTVr|=" << r_norm
+        if (g_log_enable && g_log_warn) LOG(WARNING) << "[ESKF] Map conflict detected — |HTVr|=" << r_norm
                      << " for " << conflict_count << " frames";
       }
     } else {

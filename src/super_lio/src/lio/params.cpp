@@ -17,6 +17,21 @@ namespace LI2Sup{
   bool g_decouple_verify = false;  // compare 18×18 decoupled vs 32×32 full solve
   bool g_pose_dc_dump = false;     // dump per-frame H_pose + ΔC + relative extrinsic (Eq.(20) analysis)
 
+  /// logging control (lio.log.*) —— 默认值与改造前实际表现一致，见 config/M20.yaml
+  bool g_log_enable = true;
+  bool g_log_warn = true;
+  bool g_log_reloc_init = true;
+  bool g_log_reloc_cand = false;
+  bool g_log_calib = true;
+  bool g_log_bias = true;
+  bool g_log_solver = true;
+  bool g_log_input = true;
+  bool g_log_update_map = false;
+  int  g_log_calib_frames = 100;
+  int  g_log_bias_frames = 100;
+  int  g_log_solver_frames = 200;
+  double g_log_input_period_sec = 100.0;
+
   bool   g_save_map;
   bool   g_if_filter; 
   string g_save_map_dir;

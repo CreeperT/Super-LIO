@@ -99,7 +99,7 @@ void SuperLIOReLoc::init(){
   // Relocation uses a prior map as the sole reference — clearing it is fatal.
   allow_map_reset_ = false;
 
-  if (g_verbose_logging) {
+  if (g_log_enable && g_verbose_logging) {
     LOG(INFO) << GREEN << " ---> [SuperLIO]: initialized. "
               << "P_lb=" << (g_p_lower_bound_enabled ? "ON" : "OFF")
               << " σ=" << g_p_lower_bound_trans
@@ -112,7 +112,8 @@ void SuperLIOReLoc::init(){
   SuperLIOReLoc::map_init();
   auto end_time = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-  LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init success. Time: " << duration.count() << " ms." << RESET;
+  if (g_log_enable && g_log_reloc_init)
+    LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init success. Time: " << duration.count() << " ms." << RESET;
 
   state_fn_ = &SuperLIOReLoc::stateWaitKFInit;
 }
@@ -148,12 +149,15 @@ bool SuperLIOReLoc::map_init(){
       if (pt.z < map_z_min_) map_z_min_ = pt.z;
       if (pt.z > map_z_max_) map_z_max_ = pt.z;
     }
-    LOG(INFO) << GREEN << " ---> Map Z bounds: [" << map_z_min_ << ", " << map_z_max_ << "]" << RESET;
+    if (g_log_enable && g_log_reloc_init)
+      LOG(INFO) << GREEN << " ---> Map Z bounds: [" << map_z_min_ << ", " << map_z_max_ << "]" << RESET;
   }
 
-  LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
-  LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
-  ivox_->printInfo();
+  if (g_log_enable && g_log_reloc_init) {
+    LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
+    LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
+    ivox_->printInfo();
+  }
 
   pcd_loaded = true;
 
@@ -246,7 +250,7 @@ bool SuperLIOReLoc::kf_init(){
     double ratio = (total_imu > 0) ? static_cast<double>(stationary_imu_cout) / total_imu : 0.0;
     double mean_gyro_norm = mean_gyro.norm();
     if (ratio < 0.5 || mean_gyro_norm > 0.1) {
-      LOG(WARNING) << YELLOW
+      if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW
                    << " ---> [Reloc] Robot may have been moving during init! "
                    << "stationary_imu=" << (ratio * 100) << "% "
                    << "mean_gyro=" << mean_gyro_norm << " rad/s "
@@ -255,6 +259,7 @@ bool SuperLIOReLoc::kf_init(){
     }
   }
 
+  if (g_log_enable && g_log_reloc_init)
   LOG(INFO) << YELLOW << " ---> INIT start... obs_data size: " << init_obs_data_->size()
             << " obs_data2 size: " << init_obs_data2_->size()
             << " target size: " << point_map_->size() << RESET;
@@ -286,6 +291,7 @@ bool SuperLIOReLoc::kf_init(){
       pcl::PointCloud<pcl::PointXYZI>::Ptr tmp2(new pcl::PointCloud<pcl::PointXYZI>());
       pcl::transformPointCloud(*init_obs_data2_, *tmp2, g_lidar_imu2.matrix().cast<float>());
       *tmp_src += *tmp2;
+      if (g_log_enable && g_verbose_logging)
       LOG(INFO) << CYAN << " ---> Merged lidar1(" << tmp1->size()
                 << ") + lidar2(" << tmp2->size() << ") in IMU frame." << RESET;
     }
@@ -295,7 +301,8 @@ bool SuperLIOReLoc::kf_init(){
   {
     M4 lidar_to_world = init_guess_T;  // tmp_src is already in IMU frame, init_guess_T maps IMU→World
     data_wrapper_->pub_init_obs(tmp_src, lidar_to_world.matrix().cast<float>());
-    LOG(INFO) << CYAN << " ---> Published init observation to /lio/init_obs (" << tmp_src->size() << " pts)." << RESET;
+    if (g_log_enable && g_verbose_logging)
+      LOG(INFO) << CYAN << " ---> Published init observation to /lio/init_obs (" << tmp_src->size() << " pts)." << RESET;
   }
 
   // ---- helper: downsample point cloud ----
@@ -344,6 +351,7 @@ bool SuperLIOReLoc::kf_init(){
   auto medium_target = downsample(point_map_, g_reloc_medium_ds_size);
   auto coarse_target = downsample(point_map_, g_reloc_coarse_ds_size);
 
+  if (g_log_enable && g_log_reloc_init)
   LOG(INFO) << CYAN << " ---> Multi-res targets: coarse=" << coarse_target->size()
             << " (leaf=" << g_reloc_coarse_ds_size << "m)"
             << " medium=" << medium_target->size()
@@ -427,11 +435,12 @@ bool SuperLIOReLoc::kf_init(){
       bool icp_ok = icp.hasConverged();
       double icp_score = icp.getFitnessScore();
 
-      LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
-                << " z_off=" << z_offset
-                << " | coarse=" << coarse_score
-                << " medium=" << medium_score
-                << " | ICP: ok=" << icp_ok << " score=" << icp_score;
+      if (g_log_enable && g_log_reloc_cand)
+        LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
+                  << " z_off=" << z_offset
+                  << " | coarse=" << coarse_score
+                  << " medium=" << medium_score
+                  << " | ICP: ok=" << icp_ok << " score=" << icp_score;
 
       if (icp_ok && icp_score < g_reloc_fitness_thresh) {
         M4 result = icp.getFinalTransformation().cast<scalar>();
@@ -451,9 +460,10 @@ bool SuperLIOReLoc::kf_init(){
       bool icp_ok = icp.hasConverged();
       double icp_score = icp.getFitnessScore();
 
-      LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
-                << " z_off=" << z_offset
-                << " | NDT+ICP: ok=" << icp_ok << " score=" << icp_score;
+      if (g_log_enable && g_log_reloc_cand)
+        LOG(INFO) << " ---> yaw=" << yaw_offset_deg << "°"
+                  << " z_off=" << z_offset
+                  << " | NDT+ICP: ok=" << icp_ok << " score=" << icp_score;
 
       if (icp_ok && icp_score < g_reloc_fitness_thresh) {
         M4 result = icp.getFinalTransformation().cast<scalar>();
@@ -471,7 +481,7 @@ bool SuperLIOReLoc::kf_init(){
 
   // ---- multi-yaw + z-offset fallback ----
   if (!success && g_reloc_multi_yaw_search) {
-    LOG(WARNING) << YELLOW << " ---> First attempt failed, trying multi-yaw + z-offset search..."
+    if (g_log_enable && g_log_warn) LOG(WARNING) << YELLOW << " ---> First attempt failed, trying multi-yaw + z-offset search..."
                  << " z_range=±" << g_reloc_z_search_range
                  << " z_step=" << g_reloc_z_search_step << RESET;
 
@@ -490,6 +500,7 @@ bool SuperLIOReLoc::kf_init(){
           auto [ok, T] = try_registration(yaw_off, z_off);
           if (ok) {
             double score = icp.getFitnessScore();
+            if (g_log_enable && g_log_reloc_init)
             LOG(INFO) << GREEN << " ---> Found: yaw=" << yaw_off
                       << "° z_off=" << z_off
                       << " ICP score=" << score << RESET;
@@ -513,13 +524,16 @@ bool SuperLIOReLoc::kf_init(){
     init_obs_data_->clear();
     mean_gyro = V3::Zero();
     mean_acce = V3::Zero();
+    if (g_log_enable && g_log_reloc_init)
     LOG(INFO) << RED << " ---> Global ICP Converged Fail! BestFitnessScore: " << best_icp_score << RESET;
     return false;
   } else{
     init_guess_T = best_T;
+    if (g_log_enable && g_log_reloc_init)
     LOG(INFO) << GREEN << " ---> Global ICP Converged Succeed! FitnessScore: " << best_icp_score << RESET;
   }
 
+  if (g_log_enable && g_log_reloc_init)
   LOG(INFO) << GREEN << "\n" << init_guess_T << RESET;
 
   ESKF::Options options;
@@ -586,7 +600,9 @@ void SuperLIOReLoc::UpdateMap() {
   static int __update_delay = 100;
   if (__update_delay > 0) {
     __update_delay--;
-    std::cout << "Update map Delay: " << 100 - __update_delay << " %" << std::endl;
+    if (g_log_enable && g_log_update_map)
+      LOG(INFO) << YELLOW << " ---> [UpdateMap] delay progress: "
+                << 100 - __update_delay << " %" << RESET;
     return;
   }
 
@@ -615,9 +631,11 @@ void SuperLIOReLoc::Output() {
 
   // ── Phase 1: calibration status log (before early return) ──
   if (kf_->isCalibEnabled()) {
+    // 帧号逐帧推进：下面的 CSV 逐帧落盘要用它当帧序号
     static int calib_log_count = 0;
-    int interval = (calib_log_count < 10) ? 1 : 100;
-    if (++calib_log_count % interval == 0) {
+    ++calib_log_count;
+    static LogGate calib_gate(10);          // 前 10 帧每帧，之后 lio.log.calib_frames
+    if (log_hit(calib_gate, g_log_calib, g_log_calib_frames)) {
       SE3 est1 = kf_->getExtrinsic1();
       SE3 est2 = kf_->getExtrinsic2();
       V3 rpy1 = SO3(est1.R_).log_vee() * 180.0 / M_PI;
@@ -662,11 +680,10 @@ void SuperLIOReLoc::Output() {
   // ── Accelerometer / gyroscope bias ──
   // Outside the calibration gate on purpose — see the note in SuperLIO::stateProcess().
   {
-    static int bias_log_count = 0;
-    int interval = (bias_log_count < 10) ? 1 : 100;
-    if (++bias_log_count % interval == 0) {
+    static LogGate bias_gate(10);         // 前 10 帧每帧，之后 lio.log.bias_frames
+    if (log_hit(bias_gate, g_log_bias, g_log_bias_frames)) {
       auto st = kf_->GetSysState();
-      LOG(INFO) << YELLOW << " ---> [Bias#" << bias_log_count
+      LOG(INFO) << YELLOW << " ---> [Bias#" << bias_gate.count()
                 << "] ba=[" << st.ba.transpose() << "] |ba|=" << st.ba.norm()
                 << " bg=[" << st.bg.transpose() << "] |bg|=" << st.bg.norm()
                 << RESET;
